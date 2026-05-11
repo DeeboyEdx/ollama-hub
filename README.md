@@ -85,11 +85,13 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 |---|---|---|
 | `--url URL` | `http://localhost:11434` | Ollama server URL |
 | `--poll SECS` | `3` | Polling interval in seconds (min 1) |
-| `--no-gpu` | off | Disable GPU% and CPU% monitoring (use when monitoring a remote machine) |
+| `--no-gpu` | off | Disable GPU% and CPU% monitoring |
 | `--no-cpu` | off | Alias for `--no-gpu` |
 | `--no-xpu` | off | Alias for `--no-gpu` |
 
 `--url` falls back to the `OLLAMA_SERVER_URL` environment variable if set.
+
+> **Note:** GPU% and CPU% are always read from the **local machine** running the overlay, not the Ollama server. If you point `--url` at a remote machine, use `--no-gpu` / `--no-xpu` to suppress those graphs — otherwise they'll reflect your local hardware, not the server's.
 
 ---
 
@@ -114,7 +116,7 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 ```
 
 To rebuild the exe after modifying `ollama_monitor.py`, just double-click **`build.bat`**.
-Build intermediates go to `%TEMP%\pyibuild-ollama-monitor` to avoid OneDrive/cloud sync churn.
+Build intermediates go to `%TEMP%\pyibuild-ollama-monitor` to avoid local directory clutter or OneDrive/cloud sync churn.
 
 ---
 
