@@ -150,6 +150,7 @@ class OllamaOverlay:
         self._gpu_history:  deque = deque(maxlen=self.max_history)
         self._cpu_history:  deque = deque()     # (monotonic_ts, pct) tuples; no fixed maxlen
         self._zero_since:   float | None = None  # monotonic time CPU first hit 0%
+        self._had_ram_model: bool = False        # True once a RAM-using model has been seen
         self._ollama_proc         = None
         self._after_id            = None
 
@@ -291,6 +292,7 @@ class OllamaOverlay:
             self._clear_all_model_rows()
             self.placeholder.config(text="Ollama offline", fg=RED)
             self.placeholder.pack()
+            self._update_cpu_header(any_ram=False)
             return
 
         if models is None:
@@ -298,6 +300,7 @@ class OllamaOverlay:
             self._clear_all_model_rows()
             self.placeholder.config(text="Connection error", fg=ORANGE)
             self.placeholder.pack()
+            self._update_cpu_header(any_ram=False)
             return
 
         if not models:
@@ -305,35 +308,16 @@ class OllamaOverlay:
             self._clear_all_model_rows()
             self.placeholder.config(text="No models loaded", fg=DIM)
             self.placeholder.pack()
+            self._update_cpu_header(any_ram=False)
             return
 
         self._set_status("online")
         self.placeholder.pack_forget()
 
-        # CPU% graph + label in header when any model spills to RAM
         any_ram = any(
             max(0, m.get("size", 0) - m.get("size_vram", 0)) > 0 for m in models
         )
-        _mono = time.monotonic()
-        idle_secs = (_mono - self._zero_since) if self._zero_since is not None else 0.0
-        cpu_fully_hidden = idle_secs >= 2 * HISTORY_SECS  # 6 min of 0%
-        if any_ram and self.gpu_enabled and not cpu_fully_hidden:
-            cpu_now = self._cpu_history[-1][1] if self._cpu_history else None
-            cpu_text = f"CPU {cpu_now:.0f}%" if cpu_now is not None else ""
-            valid = [v for _, v in self._cpu_history if v is not None]
-            peak = max(valid) if valid else 0
-            show_peak = peak > 11.0 and (cpu_now is None or cpu_now < peak * 0.5)
-            peak_text = f"{peak:.0f}%" if show_peak else ""
-            hw = self.header_canvas.winfo_width()
-            hh = self.header_canvas.winfo_height()
-            if hw > 1 and hh > 1:
-                self._draw_cpu_graph(self.header_canvas, hw, hh)
-            self.header_canvas.itemconfig(self._hdr_cpu_id, text=cpu_text)
-            self.header_canvas.itemconfig(self._hdr_peak_id, text=peak_text)
-        else:
-            self.header_canvas.delete("graph")
-            self.header_canvas.itemconfig(self._hdr_cpu_id, text="")
-            self.header_canvas.itemconfig(self._hdr_peak_id, text="")
+        self._update_cpu_header(any_ram=any_ram)
 
         current_names = {m.get("name", "unknown") for m in models}
 
@@ -429,6 +413,35 @@ class OllamaOverlay:
         canvas.create_line([c for pt in coords for c in pt],
                            fill=CPU_LINE, width=1, tags="graph")
         canvas.tag_raise("hdr")
+
+    def _update_cpu_header(self, any_ram: bool = False):
+        """Redraw CPU graph and update header labels. Called every poll."""
+        _mono = time.monotonic()
+        idle_secs = (_mono - self._zero_since) if self._zero_since is not None else 0.0
+        cpu_fully_hidden = idle_secs >= 2 * HISTORY_SECS  # 6 min of 0%
+
+        if any_ram:
+            self._had_ram_model = True
+        if cpu_fully_hidden:
+            self._had_ram_model = False
+
+        if self.gpu_enabled and self._had_ram_model and not cpu_fully_hidden:
+            cpu_now = self._cpu_history[-1][1] if self._cpu_history else None
+            cpu_text = f"CPU {cpu_now:.0f}%" if cpu_now is not None else ""
+            valid = [v for _, v in self._cpu_history if v is not None]
+            peak = max(valid) if valid else 0
+            show_peak = peak > 11.0 and (cpu_now is None or cpu_now < peak * 0.5)
+            peak_text = f"{peak:.0f}%" if show_peak else ""
+            hw = self.header_canvas.winfo_width()
+            hh = self.header_canvas.winfo_height()
+            if hw > 1 and hh > 1:
+                self._draw_cpu_graph(self.header_canvas, hw, hh)
+            self.header_canvas.itemconfig(self._hdr_cpu_id, text=cpu_text)
+            self.header_canvas.itemconfig(self._hdr_peak_id, text=peak_text)
+        else:
+            self.header_canvas.delete("graph")
+            self.header_canvas.itemconfig(self._hdr_cpu_id, text="")
+            self.header_canvas.itemconfig(self._hdr_peak_id, text="")
 
     def _create_model_row(self, m: dict):
         name: str = m.get("name", "unknown")
