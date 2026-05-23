@@ -249,6 +249,10 @@ class OllamaOverlay:
         menu.add_command(label="Quit", command=self._quit)
         menu.tk_popup(event.x_root, event.y_root)
 
+    def _reset_position(self):
+        sw = self.root.winfo_screenwidth()
+        self.root.geometry(f"+{sw - WINDOW_W - 16}+10")
+
     # ── Poll + UI update ──────────────────────────────────────────────────────
 
     def _poll(self):
@@ -617,6 +621,10 @@ class OllamaOverlay:
                 "Show / Hide",
                 lambda icon, item: self.toggle_visibility(),
                 default=True,
+            ),
+            pystray.MenuItem(
+                "Reset position",
+                lambda icon, item: self.root.after(0, self._reset_position),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
