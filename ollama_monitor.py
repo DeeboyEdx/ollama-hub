@@ -9,6 +9,7 @@ Usage: python ollama_monitor.py [--url http://localhost:11434]
 import re
 import sys
 import time
+import socket
 import threading
 import tkinter as tk
 import argparse
@@ -26,6 +27,12 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 WINDOW_W  = 290
 GRAPH_H   = 48
 GRAPH_W   = WINDOW_W - 32   # inner width after content padx(8) + row padx(8)
+
+# Services to monitor (TCP reachability). Disable individually via CLI flags.
+ALL_SERVICES = [
+    {"key": "litellm",   "label": "LiteLLM",   "host": "localhost", "port": 4000},
+    {"key": "websearch", "label": "WebSearch",  "host": "localhost", "port": 8765},
+]
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG          = "#0d1117"
@@ -82,6 +89,14 @@ def fetch_models(base_url: str):
         return None, str(e)
 
 
+def check_tcp_port(host: str, port: int, timeout: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 # ── GPU utilisation (NVML / nvidia-smi fallback) ──────────────────────────────
 
 try:
@@ -135,11 +150,12 @@ def make_tray_icon(color: str) -> Image.Image:
 
 class OllamaOverlay:
     def __init__(self, ollama_url: str, poll_secs: int = DEFAULT_POLL_SECS,
-                 gpu_enabled: bool = True):
+                 gpu_enabled: bool = True, services: list | None = None):
         self.ollama_url      = ollama_url
         self.poll_interval_ms = poll_secs * 1000
         self.max_history     = max(2, HISTORY_SECS * 1000 // self.poll_interval_ms)
         self.gpu_enabled     = gpu_enabled
+        self.services        = services if services is not None else list(ALL_SERVICES)
         self.visible = True
         self.root: tk.Tk | None = None
         self.tray: pystray.Icon | None = None
@@ -151,6 +167,9 @@ class OllamaOverlay:
         self._cpu_history:  deque = deque()     # (monotonic_ts, pct) tuples; no fixed maxlen
         self._zero_since:   float | None = None  # monotonic time CPU first hit 0%
         self._had_ram_model: bool = False        # True once a RAM-using model has been seen
+        self._model_first_seen: dict[str, float] = {}  # name → monotonic load time
+        self._service_up:    dict[str, bool] = {s["key"]: False for s in self.services}
+        self._svc_dot_labels: dict[str, tk.Label] = {}
         self._ollama_proc         = None
         self._after_id            = None
 
@@ -180,6 +199,7 @@ class OllamaOverlay:
 
         self._build_header()
         self._build_content_area()
+        self._build_services_footer()
 
         self.root.after(100, self._poll)
         self.root.mainloop()
@@ -228,6 +248,28 @@ class OllamaOverlay:
         )
         self.placeholder.pack()
 
+    def _build_services_footer(self):
+        if not self.services:
+            return
+        tk.Frame(self.root, bg=BORDER_CLR, height=1).pack(fill="x")
+        footer = tk.Frame(self.root, bg=BG, padx=8, pady=4)
+        footer.pack(fill="x")
+        for svc in self.services:
+            col = tk.Frame(footer, bg=BG)
+            col.pack(side="left", expand=True, fill="x")
+            dot = tk.Label(col, text="●", fg=DIM, bg=BG, font=("Segoe UI", 8))
+            dot.pack(side="left")
+            tk.Label(col, text=f" {svc['label']}", fg=DIM, bg=BG,
+                     font=("Segoe UI", 8)).pack(side="left")
+            self._svc_dot_labels[svc["key"]] = dot
+
+    def _update_services_footer(self):
+        for svc in self.services:
+            up = self._service_up.get(svc["key"], False)
+            dot = self._svc_dot_labels.get(svc["key"])
+            if dot:
+                dot.config(fg=GREEN if up else RED)
+
     # ── Drag ─────────────────────────────────────────────────────────────────
 
     def _on_drag_start(self, event):
@@ -274,6 +316,9 @@ class OllamaOverlay:
         # Prune entries that have scrolled past the window
         while self._cpu_history and _now - self._cpu_history[0][0] > HISTORY_SECS:
             self._cpu_history.popleft()
+        for svc in self.services:
+            self._service_up[svc["key"]] = check_tcp_port(svc["host"], svc["port"])
+        self._update_services_footer()
         self._update_ui(models, error)
         if self.root:
             self._after_id = self.root.after(self.poll_interval_ms, self._poll)
@@ -346,6 +391,7 @@ class OllamaOverlay:
         if name in self._model_widgets:
             self._model_widgets[name]["frame"].destroy()
             del self._model_widgets[name]
+        self._model_first_seen.pop(name, None)
 
     def _set_status(self, status: str):
         if status == self._last_status:
@@ -465,6 +511,15 @@ class OllamaOverlay:
         row = tk.Frame(self.content, bg=ROW_BG, padx=8, pady=6)
         row.pack(fill="x", pady=2)
 
+        # ── "new" badge — shown for first 60 s after load ─────────────────────
+        if name not in self._model_first_seen:
+            self._model_first_seen[name] = time.monotonic()
+        new_lbl = tk.Label(row, text="new", fg=GREEN, bg=ROW_BG,
+                           font=("Segoe UI", 7), anchor="w")
+        elapsed = time.monotonic() - self._model_first_seen[name]
+        if elapsed < 60:
+            new_lbl.pack(anchor="w", pady=(0, 1))
+
         # ── Row 1: name + quant (static for life of row) ─────────────────────
         r1 = tk.Frame(row, bg=ROW_BG)
         r1.pack(fill="x")
@@ -502,6 +557,7 @@ class OllamaOverlay:
         self._model_widgets[name] = {
             "frame": row, "canvas": canvas,
             "ram_lbl": ram_lbl, "exp_lbl": exp_lbl,
+            "new_lbl": new_lbl,
         }
 
     def _update_model_row(self, name: str, m: dict):
@@ -515,6 +571,12 @@ class OllamaOverlay:
                                   self._gpu_history, GRAPH_W, GRAPH_H)
         self._apply_mem_label(w["ram_lbl"], size_vram, size_ram, size)
         w["exp_lbl"].config(text=f"⏱ {time_until(expires)}" if expires else "")
+
+        # Hide "new" badge after 60 s
+        if "new_lbl" in w:
+            elapsed = time.monotonic() - self._model_first_seen.get(name, 0)
+            if elapsed >= 60:
+                w["new_lbl"].pack_forget()
 
     @staticmethod
     def _apply_mem_label(lbl: tk.Label, size_vram: int, size_ram: int, size: int):
@@ -667,12 +729,28 @@ def main():
         action="store_true", dest="no_gpu",
         help="Disable GPU%%/CPU%% querying (use when monitoring a remote Ollama server)"
     )
+    parser.add_argument(
+        "--no-litellm", action="store_true",
+        help="Disable LiteLLM service status indicator"
+    )
+    parser.add_argument(
+        "--no-websearch", action="store_true",
+        help="Disable WebSearch MCP service status indicator"
+    )
     args = parser.parse_args()
+
+    disabled = set()
+    if args.no_litellm:
+        disabled.add("litellm")
+    if args.no_websearch:
+        disabled.add("websearch")
+    services = [s for s in ALL_SERVICES if s["key"] not in disabled]
 
     app = OllamaOverlay(
         ollama_url=args.url,
         poll_secs=max(1, args.poll),
         gpu_enabled=not args.no_gpu,
+        services=services,
     )
     app.run()
 
