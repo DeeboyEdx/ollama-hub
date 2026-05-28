@@ -9,6 +9,7 @@ Usage: python ollama_monitor.py [--url http://localhost:11434]
 import re
 import sys
 import time
+import glob as _glob_mod
 import socket
 import threading
 import tkinter as tk
@@ -30,8 +31,9 @@ GRAPH_W   = WINDOW_W - 32   # inner width after content padx(8) + row padx(8)
 
 # Services to monitor (TCP reachability). Disable individually via CLI flags.
 ALL_SERVICES = [
-    {"key": "litellm",   "label": "LiteLLM",   "host": "localhost", "port": 4000},
-    {"key": "websearch", "label": "WebSearch",  "host": "localhost", "port": 8765},
+    {"key": "litellm",   "label": "LiteLLM",        "host": "localhost", "port": 4000},
+    {"key": "websearch", "label": "MCP: WebSearch",  "host": "localhost", "port": 8765,
+     "log_dir": r"C:\Users\aquar\mcp-servers\logs", "log_pattern": "gateway-*.log"},
 ]
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -43,6 +45,9 @@ ROW_BG      = "#161b22"
 BORDER_CLR  = "#21262d"
 GREEN       = "#3fb950"
 GREEN_FILL  = "#1a4228"   # dark green for graph fill
+SVC_BLINK_DIM   = "#1a6b28" # mid-dark green for service dot idle-on state
+SVC_RESTART_ON  = "#58a6ff" # bright blue for restart pulse on
+SVC_RESTART_OFF = "#0d2645" # dim blue for restart pulse off
 GPU_LINE    = "#a371f7"   # purple for GPU % line
 GPU_FILL    = "#1e1035"   # dark purple for GPU % fill
 ORANGE      = "#f0883e"
@@ -95,6 +100,96 @@ def check_tcp_port(host: str, port: int, timeout: float = 0.3) -> bool:
             return True
     except OSError:
         return False
+
+
+def _get_tcp_client_ips(port: int) -> list[str]:
+    """Return deduplicated list of remote IPs with ESTABLISHED connections to port."""
+    if not _PSUTIL_OK:
+        return []
+    try:
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for c in _psutil.net_connections(kind="tcp"):
+            if c.laddr.port == port and c.status == "ESTABLISHED" and c.raddr:
+                ip = c.raddr.ip
+                if ip not in seen_set:
+                    seen_set.add(ip)
+                    seen.append(ip)
+        return seen
+    except Exception:
+        return []
+
+
+class McpLogMonitor:
+    """Activity classifier for a log-writing MCP gateway service."""
+    IDLE_AGE   = 30.0     # seconds since last write → IDLE
+    LIGHT_MAX  = 6_000    # bytes/poll (spec 10 KB × 3/5 for 3s poll)
+    MEDIUM_MAX = 45_000   # bytes/poll (spec 75 KB × 3/5)
+
+    def __init__(self, log_dir: str, log_pattern: str):
+        self.log_dir     = log_dir
+        self.log_pattern = log_pattern
+        self._current_log: str | None = None
+        self._last_size: int = 0
+
+    def poll(self) -> str:
+        """Returns: UNAVAILABLE | IDLE | JUST_FINISHED | LIGHT | MEDIUM | HEAVY | RESTARTED"""
+        import os
+        try:
+            files = sorted(
+                _glob_mod.glob(os.path.join(self.log_dir, self.log_pattern)),
+                key=os.path.getmtime,
+            )
+        except Exception:
+            return "UNAVAILABLE"
+        if not files:
+            return "UNAVAILABLE"
+
+        newest = files[-1]
+        restarted = newest != self._current_log
+        if restarted:
+            self._current_log = newest
+            self._last_size = 0
+
+        try:
+            import os as _os
+            stat = _os.stat(newest)
+        except OSError:
+            return "UNAVAILABLE"
+
+        age   = time.time() - stat.st_mtime
+        size  = stat.st_size
+        delta = max(0, size - self._last_size)
+        self._last_size = size
+
+        if restarted:
+            return "RESTARTED"
+        if age >= self.IDLE_AGE:
+            return "IDLE"
+        if delta == 0:
+            return "JUST_FINISHED"
+        if delta <= self.LIGHT_MAX:
+            return "LIGHT"
+        if delta <= self.MEDIUM_MAX:
+            return "MEDIUM"
+        return "HEAVY"
+
+
+# Blink tick intervals (ms) keyed by connection count thresholds
+_BLINK_FAST_MS = 150
+_BLINK_MED_MS  = 350
+_BLINK_SLOW_MS = 700
+_BLINK_IDLE_MS = 1000   # no active service — keep ticking for state changes
+_RESTART_BLINK_MS = 700
+
+# Half-cycle duration (ms) per log-monitor state — drives dot pulse rate
+_STATE_BLINK_MS: dict[str, int] = {
+    "JUST_FINISHED": 1500,   # long slow breathing pulse
+    "LIGHT":          700,   # slow pulse
+    "MEDIUM":         350,   # moderate pulse
+    "HEAVY":          150,   # fast pulse
+    "RESTARTED":      700,   # handled via _svc_restart_until; same tempo as LIGHT
+}
 
 
 # ── GPU utilisation (NVML / nvidia-smi fallback) ──────────────────────────────
@@ -150,11 +245,13 @@ def make_tray_icon(color: str) -> Image.Image:
 
 class OllamaOverlay:
     def __init__(self, ollama_url: str, poll_secs: int = DEFAULT_POLL_SECS,
-                 gpu_enabled: bool = True, services: list | None = None):
+                 gpu_enabled: bool = True, services: list | None = None,
+                 remote: bool = False):
         self.ollama_url      = ollama_url
         self.poll_interval_ms = poll_secs * 1000
         self.max_history     = max(2, HISTORY_SECS * 1000 // self.poll_interval_ms)
-        self.gpu_enabled     = gpu_enabled
+        self.gpu_enabled     = gpu_enabled and not remote
+        self.remote          = remote
         self.services        = services if services is not None else list(ALL_SERVICES)
         self.visible = True
         self.root: tk.Tk | None = None
@@ -168,8 +265,28 @@ class OllamaOverlay:
         self._zero_since:   float | None = None  # monotonic time CPU first hit 0%
         self._had_ram_model: bool = False        # True once a RAM-using model has been seen
         self._model_first_seen: dict[str, float] = {}  # name → monotonic load time
-        self._service_up:    dict[str, bool] = {s["key"]: False for s in self.services}
-        self._svc_dot_labels: dict[str, tk.Label] = {}
+        self._poll_count: int = 0
+        self._service_up:        dict[str, bool]        = {s["key"]: False for s in self.services}
+        self._service_activity:  dict[str, int]         = {s["key"]: 0     for s in self.services}
+        self._service_state:     dict[str, str]         = {s["key"]: "IDLE" for s in self.services}
+        self._service_client_ips: dict[str, list[str]] = {s["key"]: []     for s in self.services}
+        self._svc_dot_labels:    dict[str, tk.Label]   = {}
+        self._svc_client_labels: dict[str, tk.Label]   = {}
+        self._svc_blink_state:   dict[str, bool]       = {s["key"]: False  for s in self.services}
+        self._svc_next_toggle:   dict[str, float]      = {s["key"]: 0.0    for s in self.services}
+        self._svc_restart_until: dict[str, float]      = {s["key"]: 0.0    for s in self.services}
+        self._log_monitors: dict[str, McpLogMonitor] = {}
+        if not remote:
+            for svc in self.services:
+                if svc.get("log_dir"):
+                    self._log_monitors[svc["key"]] = McpLogMonitor(
+                        svc["log_dir"], svc["log_pattern"]
+                    )
+        self._hostname_cache: dict[str, str] = {
+            "127.0.0.1": "localhost", "::1": "localhost", "0.0.0.0": "localhost",
+        }
+        self._resolving: set[str] = set()
+        self._client_first_seen: dict[str, dict[str, float]] = {s["key"]: {} for s in self.services}
         self._ollama_proc         = None
         self._after_id            = None
 
@@ -200,6 +317,9 @@ class OllamaOverlay:
         self._build_header()
         self._build_content_area()
         self._build_services_footer()
+        if self.services:
+            self.root.after(200, self._blink_tick)
+        self.root.after(200, self._ollama_blink_tick)
 
         self.root.after(100, self._poll)
         self.root.mainloop()
@@ -252,23 +372,115 @@ class OllamaOverlay:
         if not self.services:
             return
         tk.Frame(self.root, bg=BORDER_CLR, height=1).pack(fill="x")
-        footer = tk.Frame(self.root, bg=BG, padx=8, pady=4)
+        footer = tk.Frame(self.root, bg=BG, padx=8, pady=7)
         footer.pack(fill="x")
         for svc in self.services:
             col = tk.Frame(footer, bg=BG)
-            col.pack(side="left", expand=True, fill="x")
-            dot = tk.Label(col, text="●", fg=DIM, bg=BG, font=("Segoe UI", 8))
+            col.pack(side="left", expand=True, fill="x", anchor="n")
+
+            indicator = tk.Frame(col, bg=BG)
+            indicator.pack(fill="x", anchor="w")
+            dot = tk.Label(indicator, text="●", fg=DIM, bg=BG, font=("Segoe UI", 8))
             dot.pack(side="left")
-            tk.Label(col, text=f" {svc['label']}", fg=DIM, bg=BG,
+            tk.Label(indicator, text=f" {svc['label']}", fg=DIM, bg=BG,
                      font=("Segoe UI", 8)).pack(side="left")
             self._svc_dot_labels[svc["key"]] = dot
 
+            client_lbl = tk.Label(col, text="", fg=DIM, bg=BG,
+                                  font=("Segoe UI", 7), anchor="w", justify="left")
+            client_lbl.pack(fill="x", padx=(10, 0))
+            self._svc_client_labels[svc["key"]] = client_lbl
+
     def _update_services_footer(self):
+        # Kept for manual one-shot refresh; ongoing updates handled by _blink_tick.
         for svc in self.services:
             up = self._service_up.get(svc["key"], False)
             dot = self._svc_dot_labels.get(svc["key"])
             if dot:
-                dot.config(fg=GREEN if up else RED)
+                dot.config(fg=SVC_BLINK_DIM if up else RED)
+
+    def _resolve_hostname(self, ip: str):
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            hostname = ip
+        self._hostname_cache[ip] = hostname
+        self._resolving.discard(ip)
+        if self.root:
+            self.root.after(0, self._refresh_client_labels)
+
+    def _refresh_client_labels(self):
+        any_clients = False
+        for svc in self.services:
+            lbl = self._svc_client_labels.get(svc["key"])
+            if not lbl:
+                continue
+            ips = self._service_client_ips.get(svc["key"], [])
+            names = [self._hostname_cache.get(ip, ip).lower() for ip in ips]
+            if names:
+                lbl.config(text="\n".join(names))
+                lbl.pack(fill="x", padx=(10, 0))
+                any_clients = True
+            else:
+                lbl.config(text="")
+                lbl.pack_forget()
+        _ = any_clients  # reserved for future footer height adjustment if needed
+
+    def _state_for_service(self, key: str) -> str:
+        """Unified activity state regardless of detection method."""
+        if key in self._log_monitors:
+            return self._service_state.get(key, "IDLE")
+        count = self._service_activity.get(key, 0)
+        if count >= 4:   return "HEAVY"
+        elif count >= 2: return "MEDIUM"
+        elif count >= 1: return "LIGHT"
+        return "IDLE"
+
+    def _blink_tick(self):
+        _now = time.monotonic()
+        min_next = _now + 1.0  # default: check again in 1s if nothing is pulsing
+
+        for svc in self.services:
+            key = svc["key"]
+            dot = self._svc_dot_labels.get(key)
+            if not dot:
+                continue
+            up = self._service_up.get(key, False)
+
+            if not up:
+                dot.config(fg=RED)
+                self._svc_blink_state[key] = False
+                continue
+
+            # Restart animation takes priority
+            if _now < self._svc_restart_until.get(key, 0.0):
+                if _now >= self._svc_next_toggle[key]:
+                    blink = not self._svc_blink_state[key]
+                    self._svc_blink_state[key] = blink
+                    dot.config(fg=SVC_RESTART_ON if blink else SVC_RESTART_OFF)
+                    self._svc_next_toggle[key] = _now + _RESTART_BLINK_MS / 1000
+                min_next = min(min_next, self._svc_next_toggle[key])
+                continue
+
+            state      = self._state_for_service(key)
+            half_cycle = _STATE_BLINK_MS.get(state, 0)
+
+            if half_cycle == 0:
+                # IDLE / UNAVAILABLE — solid dim green, no scheduling needed
+                dot.config(fg=SVC_BLINK_DIM)
+                self._svc_blink_state[key] = False
+            else:
+                if _now >= self._svc_next_toggle[key]:
+                    blink = not self._svc_blink_state[key]
+                    self._svc_blink_state[key] = blink
+                    dot.config(fg=GREEN if blink else SVC_BLINK_DIM)
+                    self._svc_next_toggle[key] = _now + half_cycle / 1000
+                min_next = min(min_next, self._svc_next_toggle[key])
+
+        delay_ms = max(50, int((min_next - time.monotonic()) * 1000))
+        if self.root:
+            self.root.after(delay_ms, self._blink_tick)
+
 
     # ── Drag ─────────────────────────────────────────────────────────────────
 
@@ -298,6 +510,7 @@ class OllamaOverlay:
     # ── Poll + UI update ──────────────────────────────────────────────────────
 
     def _poll(self):
+        self._poll_count += 1
         models, error = fetch_models(self.ollama_url)
         gpu_pct = fetch_gpu_pct() if self.gpu_enabled else None
         self._gpu_history.append(gpu_pct)
@@ -317,8 +530,51 @@ class OllamaOverlay:
         while self._cpu_history and _now - self._cpu_history[0][0] > HISTORY_SECS:
             self._cpu_history.popleft()
         for svc in self.services:
-            self._service_up[svc["key"]] = check_tcp_port(svc["host"], svc["port"])
-        self._update_services_footer()
+            key = svc["key"]
+            up  = check_tcp_port(svc["host"], svc["port"])
+            self._service_up[key] = up
+
+            if not up:
+                self._service_activity[key]   = 0
+                self._service_state[key]      = "IDLE"
+                self._service_client_ips[key] = []
+                self._svc_restart_until[key]  = 0.0
+                continue
+
+            # ── Activity level ─────────────────────────────────────────────
+            if key in self._log_monitors:
+                state = self._log_monitors[key].poll()
+                self._service_state[key] = state
+                if state == "RESTARTED":
+                    self._svc_restart_until[key] = time.monotonic() + 4.0
+                self._service_activity[key] = 0 if state in ("IDLE", "UNAVAILABLE") else 1
+            elif not self.remote:
+                conn_count = len(_get_tcp_client_ips(svc["port"]))
+                self._service_activity[key] = conn_count
+
+            # ── Client IP tracking (local only) ────────────────────────────
+            if not self.remote:
+                ips = _get_tcp_client_ips(svc["port"])
+                self._client_first_seen[key] = {
+                    ip: ts for ip, ts in self._client_first_seen[key].items()
+                    if ip in set(ips)
+                }
+                for ip in ips:
+                    if ip not in self._client_first_seen[key]:
+                        self._client_first_seen[key][ip] = _now
+                sorted_ips = sorted(
+                    ips,
+                    key=lambda ip: self._client_first_seen[key].get(ip, 0),
+                    reverse=True,
+                )
+                self._service_client_ips[key] = sorted_ips
+                for ip in sorted_ips:
+                    if ip not in self._hostname_cache and ip not in self._resolving:
+                        self._resolving.add(ip)
+                        threading.Thread(
+                            target=self._resolve_hostname, args=(ip,), daemon=True
+                        ).start()
+        self._refresh_client_labels()
         self._update_ui(models, error)
         if self.root:
             self._after_id = self.root.after(self.poll_interval_ms, self._poll)
@@ -397,12 +653,20 @@ class OllamaOverlay:
         if status == self._last_status:
             return
         self._last_status = status
-        color_map = {"online": GREEN, "idle": DIM, "offline": RED}
-        color = color_map.get(status, DIM)
-        self.header_canvas.itemconfig(self._hdr_dot_id, fill=color)
-        # Update tray icon colour too
+        dot_map  = {"online": SVC_BLINK_DIM, "idle": DIM, "offline": RED}
+        tray_map = {"online": GREEN,          "idle": DIM, "offline": RED}
+        self.header_canvas.itemconfig(self._hdr_dot_id, fill=dot_map.get(status, DIM))
         if self.tray:
-            self.tray.icon = make_tray_icon(color)
+            self.tray.icon = make_tray_icon(tray_map.get(status, DIM))
+
+    def _ollama_blink_tick(self):
+        gpu = self._gpu_history[-1] if self._gpu_history else None
+        if self._last_status == "online" and self.gpu_enabled:
+            active = gpu is not None and gpu > 5
+            color = GREEN if active else SVC_BLINK_DIM
+            self.header_canvas.itemconfig(self._hdr_dot_id, fill=color)
+        if self.root:
+            self.root.after(_BLINK_IDLE_MS, self._ollama_blink_tick)
 
     def _get_ollama_cpu_pct(self) -> float | None:
         """Return summed CPU % for all ollama* processes, normalised to 0-100."""
@@ -513,7 +777,9 @@ class OllamaOverlay:
 
         # ── "new" badge — shown for first 60 s after load ─────────────────────
         if name not in self._model_first_seen:
-            self._model_first_seen[name] = time.monotonic()
+            # Pre-expire for models present at startup (first 2 polls)
+            seen_at = time.monotonic() if self._poll_count > 2 else time.monotonic() - 61
+            self._model_first_seen[name] = seen_at
         new_lbl = tk.Label(row, text="new", fg=GREEN, bg=ROW_BG,
                            font=("Segoe UI", 7), anchor="w")
         elapsed = time.monotonic() - self._model_first_seen[name]
@@ -737,6 +1003,11 @@ def main():
         "--no-websearch", action="store_true",
         help="Disable WebSearch MCP service status indicator"
     )
+    parser.add_argument(
+        "--remote", action="store_true",
+        help="Remote/LAN mode: disables all local-only features "
+             "(service activity, client tracking, GPU%%/CPU%%)"
+    )
     args = parser.parse_args()
 
     disabled = set()
@@ -751,6 +1022,7 @@ def main():
         poll_secs=max(1, args.poll),
         gpu_enabled=not args.no_gpu,
         services=services,
+        remote=args.remote,
     )
     app.run()
 
