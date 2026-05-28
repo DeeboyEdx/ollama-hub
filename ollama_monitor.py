@@ -1,9 +1,57 @@
 #!/usr/bin/env python3
 """
 Ollama Monitor — lightweight always-on-top overlay + system tray icon.
-Shows which Ollama models are currently loaded and their VRAM/RAM usage.
 
-Usage: python ollama_monitor.py [--url http://localhost:11434]
+Shows which Ollama models are currently loaded and their VRAM/RAM/GPU usage,
+plus service-status indicators for companion services (LiteLLM, MCP: WebSearch).
+
+────────────────────────────────────────────────────────────────────────────────
+Architecture overview
+────────────────────────────────────────────────────────────────────────────────
+
+Single-module, single-class design.  Everything runs in one process:
+
+  • Main thread  — Tkinter event loop (build_window / root.mainloop).
+                   Owns all widget creation and mutation.
+  • Tray thread  — pystray.Icon.run() in a daemon thread; calls back onto
+                   the Tk loop via root.after() to stay thread-safe.
+  • DNS threads  — short-lived daemon threads spawned on demand by _poll()
+                   to resolve client IP addresses without blocking the UI.
+  • Periodic callbacks (all scheduled with root.after, always on main thread):
+      _poll()              — fetches Ollama /api/ps + service TCP checks
+      _blink_tick()        — drives per-service dot pulse animation
+      _ollama_blink_tick() — drives the header dot based on GPU%
+
+────────────────────────────────────────────────────────────────────────────────
+Service activity detection
+────────────────────────────────────────────────────────────────────────────────
+
+LiteLLM   — TCP connection count → IDLE / LIGHT / MEDIUM / HEAVY
+WebSearch  — McpLogMonitor: reads the newest gateway-*.log file each poll and
+             classifies by bytes written since last poll.  Also detects gateway
+             restarts when the active log filename changes.
+
+In --remote mode all local-only features are disabled (log monitoring, TCP
+client tracking, hostname resolution, GPU/CPU graphs).
+
+────────────────────────────────────────────────────────────────────────────────
+CLI flags
+────────────────────────────────────────────────────────────────────────────────
+
+  --url URL         Ollama base URL (default: localhost:11434)
+  --poll SECS       Poll interval (default: 3 s)
+  --no-gpu          Disable GPU/CPU metrics
+  --no-litellm      Hide LiteLLM service indicator
+  --no-websearch    Hide WebSearch service indicator
+  --remote          Master toggle: disables everything that requires local access
+                    (implies --no-gpu, no TCP client tracking, no log monitoring)
+
+────────────────────────────────────────────────────────────────────────────────
+Usage
+────────────────────────────────────────────────────────────────────────────────
+
+  python ollama_monitor.py
+  python ollama_monitor.py --url http://my-server:11434 --remote
 """
 
 import re
@@ -61,6 +109,7 @@ HEADER_H    = 34          # fixed header height (px) for canvas underlay
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def human_bytes(n: int) -> str:
+    """Convert a byte count to a human-readable string (e.g. 1536 → '1.5 KB')."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -69,6 +118,11 @@ def human_bytes(n: int) -> str:
 
 
 def time_until(iso_string: str) -> str:
+    """Return a short human-readable countdown to an ISO-8601 expiry timestamp.
+
+    Ollama returns nanosecond-precision timestamps; we truncate to microseconds
+    so fromisoformat() can parse them on Python 3.10.
+    """
     try:
         s = re.sub(r"(\.\d{6})\d+", r"\1", iso_string).replace("Z", "+00:00")
         exp = datetime.fromisoformat(s)
@@ -83,7 +137,11 @@ def time_until(iso_string: str) -> str:
 
 
 def fetch_models(base_url: str):
-    """Returns (models_list, error_str). models_list is None on error."""
+    """Query Ollama /api/ps for currently loaded models.
+
+    Returns (models_list, error_str).  On success error_str is None.
+    On connection failure models_list is None and error_str is "offline".
+    """
     try:
         r = requests.get(f"{base_url}/api/ps", timeout=2)
         r.raise_for_status()
@@ -95,6 +153,7 @@ def fetch_models(base_url: str):
 
 
 def check_tcp_port(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Return True if a TCP connection can be established to host:port."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -103,7 +162,11 @@ def check_tcp_port(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 def _get_tcp_client_ips(port: int) -> list[str]:
-    """Return deduplicated list of remote IPs with ESTABLISHED connections to port."""
+    """Return deduplicated list of remote IPs with ESTABLISHED connections to port.
+
+    Requires psutil (and admin rights on some Windows configurations).
+    Returns [] gracefully if psutil is unavailable or the call fails.
+    """
     if not _PSUTIL_OK:
         return []
     try:
@@ -121,7 +184,29 @@ def _get_tcp_client_ips(port: int) -> list[str]:
 
 
 class McpLogMonitor:
-    """Activity classifier for a log-writing MCP gateway service."""
+    """Activity classifier for a log-writing MCP gateway service.
+
+    Each poll() call inspects the newest log file that matches the glob pattern
+    and classifies the gateway's workload by how many bytes were written since
+    the previous call.
+
+    State machine
+    ─────────────
+    UNAVAILABLE   Log directory is missing or no matching files exist.
+    RESTARTED     The active log filename changed since the last poll — the
+                  gateway process restarted (or crashed and was relaunched).
+                  This state fires exactly ONCE per restart event; subsequent
+                  polls return the real activity level.
+    IDLE          No bytes written for ≥ IDLE_AGE seconds.
+    JUST_FINISHED File was written recently but nothing new this poll (delta==0).
+                  The gateway finished a request and is now waiting quietly.
+    LIGHT         Low write rate (≤ LIGHT_MAX bytes/poll).
+    MEDIUM        Moderate write rate (≤ MEDIUM_MAX bytes/poll).
+    HEAVY         High write rate (> MEDIUM_MAX bytes/poll).
+
+    Thresholds are scaled from a 5 s reference poll to the actual 3 s poll rate
+    (multiply spec values by 3/5).
+    """
     IDLE_AGE   = 30.0     # seconds since last write → IDLE
     LIGHT_MAX  = 6_000    # bytes/poll (spec 10 KB × 3/5 for 3s poll)
     MEDIUM_MAX = 45_000   # bytes/poll (spec 75 KB × 3/5)
@@ -129,13 +214,14 @@ class McpLogMonitor:
     def __init__(self, log_dir: str, log_pattern: str):
         self.log_dir     = log_dir
         self.log_pattern = log_pattern
-        self._current_log: str | None = None
-        self._last_size: int = 0
+        self._current_log: str | None = None   # path of log file seen last poll
+        self._last_size: int = 0               # byte size at last poll
 
     def poll(self) -> str:
-        """Returns: UNAVAILABLE | IDLE | JUST_FINISHED | LIGHT | MEDIUM | HEAVY | RESTARTED"""
+        """Read the newest matching log file and return the current activity state."""
         import os
         try:
+            # Sort by mtime so the last element is always the most recent file
             files = sorted(
                 _glob_mod.glob(os.path.join(self.log_dir, self.log_pattern)),
                 key=os.path.getmtime,
@@ -146,10 +232,11 @@ class McpLogMonitor:
             return "UNAVAILABLE"
 
         newest = files[-1]
+        # A different filename means the gateway restarted and opened a new log
         restarted = newest != self._current_log
         if restarted:
             self._current_log = newest
-            self._last_size = 0
+            self._last_size = 0   # reset byte baseline for the new file
 
         try:
             import os as _os
@@ -157,17 +244,18 @@ class McpLogMonitor:
         except OSError:
             return "UNAVAILABLE"
 
-        age   = time.time() - stat.st_mtime
+        age   = time.time() - stat.st_mtime         # seconds since last write
         size  = stat.st_size
-        delta = max(0, size - self._last_size)
+        delta = max(0, size - self._last_size)       # bytes written this poll
         self._last_size = size
 
+        # RESTARTED is returned only on the first poll after a filename change
         if restarted:
             return "RESTARTED"
         if age >= self.IDLE_AGE:
             return "IDLE"
         if delta == 0:
-            return "JUST_FINISHED"
+            return "JUST_FINISHED"                   # recent activity, but quiet now
         if delta <= self.LIGHT_MAX:
             return "LIGHT"
         if delta <= self.MEDIUM_MAX:
@@ -175,24 +263,29 @@ class McpLogMonitor:
         return "HEAVY"
 
 
-# Blink tick intervals (ms) keyed by connection count thresholds
-_BLINK_FAST_MS = 150
-_BLINK_MED_MS  = 350
-_BLINK_SLOW_MS = 700
-_BLINK_IDLE_MS = 1000   # no active service — keep ticking for state changes
-_RESTART_BLINK_MS = 700
+# Blink half-cycle durations (ms) — time dot stays ON or OFF before toggling.
+# Faster half-cycles = faster visible pulse = higher perceived activity.
+_BLINK_FAST_MS    = 150
+_BLINK_MED_MS     = 350
+_BLINK_SLOW_MS    = 700
+_BLINK_IDLE_MS    = 1000   # minimum re-schedule interval when nothing is pulsing
+_RESTART_BLINK_MS = 700    # blue restart pulse: same tempo as LIGHT
 
-# Half-cycle duration (ms) per log-monitor state — drives dot pulse rate
+# Maps McpLogMonitor state → dot half-cycle duration.
+# IDLE and UNAVAILABLE are absent intentionally — they render as a solid dim dot
+# with no scheduling, so _blink_tick skips them (half_cycle == 0 fallthrough).
 _STATE_BLINK_MS: dict[str, int] = {
-    "JUST_FINISHED": 1500,   # long slow breathing pulse
-    "LIGHT":          700,   # slow pulse
+    "JUST_FINISHED": 1500,   # slow breathing — activity just wrapped up
+    "LIGHT":          700,   # gentle slow pulse
     "MEDIUM":         350,   # moderate pulse
-    "HEAVY":          150,   # fast pulse
+    "HEAVY":          150,   # rapid pulse
     "RESTARTED":      700,   # handled via _svc_restart_until; same tempo as LIGHT
 }
 
 
 # ── GPU utilisation (NVML / nvidia-smi fallback) ──────────────────────────────
+# Try pynvml first (fast in-process NVML bindings).  Fall back to shelling out
+# to nvidia-smi when pynvml is not installed.  _NVML_OK gates all nvml calls.
 
 try:
     import warnings as _w
@@ -205,6 +298,8 @@ try:
 except Exception:
     _NVML_OK = False
 
+# psutil is used for TCP connection inspection and per-process CPU%.
+# It may require admin rights on some Windows configurations.
 try:
     import psutil as _psutil
     _PSUTIL_OK = True
@@ -213,7 +308,11 @@ except ImportError:
 
 
 def fetch_gpu_pct() -> float | None:
-    """Return GPU core utilisation % (0-100), or None if unavailable."""
+    """Return GPU core utilisation % (0–100), or None if unavailable.
+
+    Prefers pynvml (zero-subprocess overhead).  Falls back to nvidia-smi
+    with CREATE_NO_WINDOW so no console flashes on Windows.
+    """
     if _NVML_OK:
         try:
             util = _nvml.nvmlDeviceGetUtilizationRates(_nvml_handle)
@@ -235,6 +334,7 @@ def fetch_gpu_pct() -> float | None:
 
 
 def make_tray_icon(color: str) -> Image.Image:
+    """Render a solid-colour circle into a 64×64 RGBA image for the system tray."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([6, 6, 58, 58], fill=color)
@@ -249,32 +349,53 @@ class OllamaOverlay:
                  remote: bool = False):
         self.ollama_url      = ollama_url
         self.poll_interval_ms = poll_secs * 1000
+        # Number of history samples that fit in the rolling 3-minute window
         self.max_history     = max(2, HISTORY_SECS * 1000 // self.poll_interval_ms)
-        self.gpu_enabled     = gpu_enabled and not remote
+        self.gpu_enabled     = gpu_enabled and not remote  # remote implies no-gpu
         self.remote          = remote
         self.services        = services if services is not None else list(ALL_SERVICES)
         self.visible = True
         self.root: tk.Tk | None = None
         self.tray: pystray.Icon | None = None
         self._drag_x = self._drag_y = 0
+
+        # Tkinter widget references — keyed by model name
         self._model_widgets: dict[str, dict] = {}
-        self._last_status = ""   # "online" | "idle" | "offline"
-        self._vram_history: dict[str, deque] = {}
+
+        self._last_status = ""   # tracks "online" | "idle" | "offline" to avoid redundant updates
+
+        # Rolling deques for graph history
+        self._vram_history: dict[str, deque] = {}    # per-model VRAM samples
         self._gpu_history:  deque = deque(maxlen=self.max_history)
-        self._cpu_history:  deque = deque()     # (monotonic_ts, pct) tuples; no fixed maxlen
+        self._cpu_history:  deque = deque()           # (monotonic_ts, pct) tuples; pruned by age
+
+        # CPU freeze logic: once Ollama CPU hits 0% we keep appending for HISTORY_SECS,
+        # then freeze (stop appending) so the graph line doesn't scroll to a flat baseline.
         self._zero_since:   float | None = None  # monotonic time CPU first hit 0%
-        self._had_ram_model: bool = False        # True once a RAM-using model has been seen
-        self._model_first_seen: dict[str, float] = {}  # name → monotonic load time
-        self._poll_count: int = 0
+        self._had_ram_model: bool = False         # True once any RAM-using model was seen;
+                                                   # gates CPU graph visibility
+
+        # "new" badge: track when each model was first seen this session
+        self._model_first_seen: dict[str, float] = {}  # model name → monotonic timestamp
+        self._poll_count: int = 0                        # suppresses badge on startup models
+
+        # Per-service state (all keyed by svc["key"])
         self._service_up:        dict[str, bool]        = {s["key"]: False for s in self.services}
         self._service_activity:  dict[str, int]         = {s["key"]: 0     for s in self.services}
         self._service_state:     dict[str, str]         = {s["key"]: "IDLE" for s in self.services}
         self._service_client_ips: dict[str, list[str]] = {s["key"]: []     for s in self.services}
+
+        # Service dot widget references (populated in _build_services_footer)
         self._svc_dot_labels:    dict[str, tk.Label]   = {}
         self._svc_client_labels: dict[str, tk.Label]   = {}
+
+        # Blink animation state per service
         self._svc_blink_state:   dict[str, bool]       = {s["key"]: False  for s in self.services}
         self._svc_next_toggle:   dict[str, float]      = {s["key"]: 0.0    for s in self.services}
+        # monotonic deadline until which the restart (blue) animation overrides the normal dot colour
         self._svc_restart_until: dict[str, float]      = {s["key"]: 0.0    for s in self.services}
+
+        # Log-file monitors — only created for services that have a log_dir and when not remote
         self._log_monitors: dict[str, McpLogMonitor] = {}
         if not remote:
             for svc in self.services:
@@ -282,49 +403,64 @@ class OllamaOverlay:
                     self._log_monitors[svc["key"]] = McpLogMonitor(
                         svc["log_dir"], svc["log_pattern"]
                     )
+
+        # Hostname resolution cache; pre-populate common loopback addresses
         self._hostname_cache: dict[str, str] = {
             "127.0.0.1": "localhost", "::1": "localhost", "0.0.0.0": "localhost",
         }
-        self._resolving: set[str] = set()
+        self._resolving: set[str] = set()  # IPs currently being resolved in a background thread
+
+        # Tracks when each client IP was first seen per service (for newest-first sort)
         self._client_first_seen: dict[str, dict[str, float]] = {s["key"]: {} for s in self.services}
-        self._ollama_proc         = None
-        self._after_id            = None
+
+        self._ollama_proc         = None   # cached list of psutil Process objects for ollama*
+        self._after_id            = None   # ID of the pending _poll root.after callback
 
     # ── Window construction ───────────────────────────────────────────────────
 
     def build_window(self):
+        """Create the Tkinter root window and start the event loop.
+
+        This call blocks until the window is destroyed (i.e., the user quits).
+        The tray icon is started in a daemon thread before this is called.
+        """
         self.root = tk.Tk()
         self.root.title("Ollama Monitor")
-        self.root.overrideredirect(True)          # no title bar
+        self.root.overrideredirect(True)          # borderless / no title bar
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.93)
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
 
-        # Position: top-right, small gap from edge; constrain width
+        # Position in the top-right corner, 16 px from the screen edge
         sw = self.root.winfo_screenwidth()
         x = sw - WINDOW_W - 16
         self.root.geometry(f"+{x}+10")
         self.root.minsize(WINDOW_W, 1)
         self.root.maxsize(WINDOW_W, self.root.winfo_screenheight())
 
-        # Drag
         self.root.bind("<ButtonPress-1>", self._on_drag_start)
         self.root.bind("<B1-Motion>", self._on_drag_move)
-        # Right-click menu
         self.root.bind("<ButtonPress-3>", self._show_context_menu)
 
         self._build_header()
         self._build_content_area()
         self._build_services_footer()
         if self.services:
-            self.root.after(200, self._blink_tick)
-        self.root.after(200, self._ollama_blink_tick)
+            self.root.after(200, self._blink_tick)     # start service dot animation
+        self.root.after(200, self._ollama_blink_tick)  # start Ollama header dot animation
 
-        self.root.after(100, self._poll)
+        self.root.after(100, self._poll)               # first data fetch after brief delay
         self.root.mainloop()
 
     def _build_header(self):
+        """Build the fixed-height title bar.
+
+        Uses a Canvas instead of nested Frames so all text items can sit on top
+        of the CPU graph (drawn as canvas polygons) without an opaque widget
+        background obscuring them.  The canvas items are stored as IDs so _poll
+        can update them in place.
+        """
         tk.Frame(self.root, bg=BORDER_CLR, height=1).pack(fill="x")
 
         self.header_canvas = tk.Canvas(
@@ -332,7 +468,7 @@ class OllamaOverlay:
         )
         self.header_canvas.pack(fill="x")
 
-        cy = HEADER_H // 2   # vertical centre
+        cy = HEADER_H // 2   # vertical centre of header
 
         # Static and dynamic text items — all drawn on canvas, no opaque widget bg
         self._hdr_dot_id   = self.header_canvas.create_text(
@@ -359,6 +495,11 @@ class OllamaOverlay:
         tk.Frame(self.root, bg=BORDER_CLR, height=1).pack(fill="x")
 
     def _build_content_area(self):
+        """Create the scrollable model-list area.
+
+        Model rows are added/removed dynamically by _update_ui.
+        The placeholder label is shown when no models are loaded.
+        """
         self.content = tk.Frame(self.root, bg=BG, padx=8, pady=6)
         self.content.pack(fill="both", expand=True)
 
@@ -369,6 +510,15 @@ class OllamaOverlay:
         self.placeholder.pack()
 
     def _build_services_footer(self):
+        """Build the service-status footer below the model list.
+
+        Each service gets a column containing:
+          • A coloured dot (●) + label on one row (indicator)
+          • A Label below it for connected client hostnames (hidden when empty)
+
+        Columns are top-aligned (anchor="n") so that a service with no clients
+        doesn't vertically centre itself against one that does have clients.
+        """
         if not self.services:
             return
         tk.Frame(self.root, bg=BORDER_CLR, height=1).pack(fill="x")
@@ -400,16 +550,28 @@ class OllamaOverlay:
                 dot.config(fg=SVC_BLINK_DIM if up else RED)
 
     def _resolve_hostname(self, ip: str):
+        """Reverse-DNS lookup run in a background daemon thread.
+
+        Writes the result into _hostname_cache and schedules a label refresh
+        back on the main thread via root.after(0, ...).
+        """
         try:
             hostname = socket.gethostbyaddr(ip)[0]
         except Exception:
-            hostname = ip
+            hostname = ip   # fall back to the raw IP if resolution fails
         self._hostname_cache[ip] = hostname
         self._resolving.discard(ip)
         if self.root:
             self.root.after(0, self._refresh_client_labels)
 
     def _refresh_client_labels(self):
+        """Redraw the hostname list under each service dot.
+
+        IPs are already sorted newest-first in _service_client_ips.
+        We lowercase every hostname for visual consistency.
+        Labels are pack_forget()d (not just blanked) when empty so the footer
+        collapses to the same height as the title bar when no clients are present.
+        """
         any_clients = False
         for svc in self.services:
             lbl = self._svc_client_labels.get(svc["key"])
@@ -427,7 +589,11 @@ class OllamaOverlay:
         _ = any_clients  # reserved for future footer height adjustment if needed
 
     def _state_for_service(self, key: str) -> str:
-        """Unified activity state regardless of detection method."""
+        """Return a unified activity state string regardless of detection method.
+
+        Log-monitored services return their McpLogMonitor state directly.
+        TCP-only services map connection count to IDLE/LIGHT/MEDIUM/HEAVY.
+        """
         if key in self._log_monitors:
             return self._service_state.get(key, "IDLE")
         count = self._service_activity.get(key, 0)
@@ -437,8 +603,21 @@ class OllamaOverlay:
         return "IDLE"
 
     def _blink_tick(self):
+        """Drive the per-service dot pulse animation.
+
+        This method reschedules itself at the earliest time any service dot
+        needs to toggle — so when all services are idle (no pulsing needed) it
+        wakes up at most once per second, but during heavy activity it can wake
+        every 150 ms.
+
+        Priority order for each dot:
+          1. Service is down  → solid red, no scheduling
+          2. RESTARTED blue   → blue ON/OFF at _RESTART_BLINK_MS until deadline
+          3. Normal activity  → green ON/dim-green OFF at _STATE_BLINK_MS rate
+          4. IDLE/UNAVAILABLE → solid dim green, no scheduling
+        """
         _now = time.monotonic()
-        min_next = _now + 1.0  # default: check again in 1s if nothing is pulsing
+        min_next = _now + 1.0  # fallback: check again in 1 s if nothing is pulsing
 
         for svc in self.services:
             key = svc["key"]
@@ -452,7 +631,7 @@ class OllamaOverlay:
                 self._svc_blink_state[key] = False
                 continue
 
-            # Restart animation takes priority
+            # Restart animation overrides normal activity colours
             if _now < self._svc_restart_until.get(key, 0.0):
                 if _now >= self._svc_next_toggle[key]:
                     blink = not self._svc_blink_state[key]
@@ -477,6 +656,7 @@ class OllamaOverlay:
                     self._svc_next_toggle[key] = _now + half_cycle / 1000
                 min_next = min(min_next, self._svc_next_toggle[key])
 
+        # Schedule the next tick only as far away as the soonest pending toggle
         delay_ms = max(50, int((min_next - time.monotonic()) * 1000))
         if self.root:
             self.root.after(delay_ms, self._blink_tick)
@@ -510,6 +690,21 @@ class OllamaOverlay:
     # ── Poll + UI update ──────────────────────────────────────────────────────
 
     def _poll(self):
+        """Main periodic callback — runs every poll_interval_ms on the Tk event loop.
+
+        Sequence each tick:
+          1. Increment poll counter (used to suppress the "new" badge at startup)
+          2. Fetch loaded models from Ollama /api/ps
+          3. Sample GPU% and Ollama process CPU% (if enabled)
+          4. Prune CPU history samples older than HISTORY_SECS
+          5. For each service:
+             a. TCP port check → mark up/down
+             b. Activity level via log monitor (if configured) or TCP client count
+             c. Client IP tracking + background hostname resolution (local mode only)
+          6. Refresh hostname labels
+          7. Rebuild/update model rows (_update_ui)
+          8. Re-schedule itself
+        """
         self._poll_count += 1
         models, error = fetch_models(self.ollama_url)
         gpu_pct = fetch_gpu_pct() if self.gpu_enabled else None
@@ -517,7 +712,7 @@ class OllamaOverlay:
         cpu_pct = self._get_ollama_cpu_pct() if self.gpu_enabled else None
         _now = time.monotonic()
         if cpu_pct is not None:
-            if cpu_pct >= 0.5:   # treat < 0.5% (displays as "0%") as idle
+            if cpu_pct >= 0.5:   # treat < 0.5% (displays as "0%") as truly idle
                 self._zero_since = None
                 self._cpu_history.append((_now, cpu_pct))
             else:
@@ -525,8 +720,8 @@ class OllamaOverlay:
                     self._zero_since = _now
                 if _now - self._zero_since < HISTORY_SECS:
                     self._cpu_history.append((_now, 0.0))
-                # else: >3 min of 0% — freeze, let old entries age out
-        # Prune entries that have scrolled past the window
+                # else: >3 min of 0% — freeze; old entries age out naturally
+        # Prune samples that have scrolled off the left edge of the graph
         while self._cpu_history and _now - self._cpu_history[0][0] > HISTORY_SECS:
             self._cpu_history.popleft()
         for svc in self.services:
@@ -535,6 +730,7 @@ class OllamaOverlay:
             self._service_up[key] = up
 
             if not up:
+                # Service is down — reset all derived state so it's clean when it comes back
                 self._service_activity[key]   = 0
                 self._service_state[key]      = "IDLE"
                 self._service_client_ips[key] = []
@@ -546,6 +742,7 @@ class OllamaOverlay:
                 state = self._log_monitors[key].poll()
                 self._service_state[key] = state
                 if state == "RESTARTED":
+                    # Arm the blue restart animation for 4 seconds
                     self._svc_restart_until[key] = time.monotonic() + 4.0
                 self._service_activity[key] = 0 if state in ("IDLE", "UNAVAILABLE") else 1
             elif not self.remote:
@@ -555,19 +752,23 @@ class OllamaOverlay:
             # ── Client IP tracking (local only) ────────────────────────────
             if not self.remote:
                 ips = _get_tcp_client_ips(svc["port"])
+                # Prune IPs that are no longer connected
                 self._client_first_seen[key] = {
                     ip: ts for ip, ts in self._client_first_seen[key].items()
                     if ip in set(ips)
                 }
+                # Record first-seen time for newly connected IPs
                 for ip in ips:
                     if ip not in self._client_first_seen[key]:
                         self._client_first_seen[key][ip] = _now
+                # Sort newest-first so the most recently connected client appears at the top
                 sorted_ips = sorted(
                     ips,
                     key=lambda ip: self._client_first_seen[key].get(ip, 0),
                     reverse=True,
                 )
                 self._service_client_ips[key] = sorted_ips
+                # Kick off background DNS resolution for any unseen IP
                 for ip in sorted_ips:
                     if ip not in self._hostname_cache and ip not in self._resolving:
                         self._resolving.add(ip)
@@ -650,6 +851,13 @@ class OllamaOverlay:
         self._model_first_seen.pop(name, None)
 
     def _set_status(self, status: str):
+        """Update the header dot colour and tray icon to reflect Ollama reachability.
+
+        Only redraws when status actually changes to avoid unnecessary canvas updates.
+        The tray map uses a fully-bright green for "online" so the icon is clearly
+        visible; the header dot is dim-green (SVC_BLINK_DIM) because _ollama_blink_tick
+        overrides it with bright green when GPU is active.
+        """
         if status == self._last_status:
             return
         self._last_status = status
@@ -660,6 +868,12 @@ class OllamaOverlay:
             self.tray.icon = make_tray_icon(tray_map.get(status, DIM))
 
     def _ollama_blink_tick(self):
+        """Flash the header dot bright green while the GPU is active (>5%).
+
+        Runs on a fixed 1-second interval — much slower than _blink_tick because
+        GPU% doesn't need sub-second responsiveness.  Only applies while Ollama
+        is online; offline/idle states are handled by _set_status.
+        """
         gpu = self._gpu_history[-1] if self._gpu_history else None
         if self._last_status == "online" and self.gpu_enabled:
             active = gpu is not None and gpu > 5
@@ -669,7 +883,20 @@ class OllamaOverlay:
             self.root.after(_BLINK_IDLE_MS, self._ollama_blink_tick)
 
     def _get_ollama_cpu_pct(self) -> float | None:
-        """Return summed CPU % for all ollama* processes, normalised to 0-100."""
+        """Return summed CPU % for all ollama* processes, normalised to 0–100.
+
+        psutil.cpu_percent() per process returns a value that can exceed 100 on
+        multi-core systems (e.g. 200% means two full cores).  We divide by the
+        logical core count to normalise to a 0-100 scale.
+
+        Processes are cached across calls because scanning the full process table
+        every 3 seconds is expensive.  Dead processes are pruned each call, and
+        any newly started ollama* processes are added.
+
+        Note: the first cpu_percent() call on a new Process object always returns
+        0 (it just primes the measurement baseline).  The real value appears on
+        the next call, which is the following poll tick.
+        """
         if not _PSUTIL_OK:
             return None
         # Remove any dead processes from cache
@@ -702,23 +929,32 @@ class OllamaOverlay:
 
     @staticmethod
     def _is_proc_alive(p) -> bool:
+        """Return True if p is a running, non-zombie psutil.Process."""
         try:
             return p.is_running() and p.status() != "zombie"
         except Exception:
             return False
 
     def _draw_cpu_graph(self, canvas: tk.Canvas, w: int, h: int):
+        """Render the Ollama CPU % sparkline into the header canvas.
+
+        The graph is time-based (not sample-index-based) so gaps in polling
+        show up as gaps in the line rather than misleadingly compressing history.
+        Y-axis auto-scales to the local peak so small CPU spikes remain visible.
+        The 'graph' tag on every drawn item lets _update_cpu_header wipe and
+        redraw efficiently without destroying the canvas text items.
+        """
         canvas.delete("graph")
         now = time.monotonic()
         entries = [(t, v) for t, v in self._cpu_history if v is not None]
         if len(entries) < 2:
             return
         peak_val = max(v for _, v in entries)
-        max_val = max(peak_val, 10.0)
+        max_val = max(peak_val, 10.0)   # always scale to at least 10% so flat lines look flat
         coords = []
         for t, val in entries:
             age = now - t
-            x = w * (1.0 - age / HISTORY_SECS)
+            x = w * (1.0 - age / HISTORY_SECS)   # older samples appear further left
             y = h - max(1, int(val / max_val * h))
             coords.append((x, y))
         poly = [(coords[0][0], h)] + coords + [(coords[-1][0], h)]
@@ -726,10 +962,22 @@ class OllamaOverlay:
                               fill=CPU_FILL, outline="", tags="graph")
         canvas.create_line([c for pt in coords for c in pt],
                            fill=CPU_LINE, width=1, tags="graph")
-        canvas.tag_raise("hdr")
+        canvas.tag_raise("hdr")   # keep text items on top of the graph fill
 
     def _update_cpu_header(self, any_ram: bool = False):
-        """Redraw CPU graph and update header labels. Called every poll."""
+        """Redraw the CPU graph and update its header labels on every poll.
+
+        The CPU graph is only shown when Ollama has (or had) a RAM-using model
+        loaded — otherwise there's nothing interesting to track.
+
+        'Freeze' behaviour: after 6 minutes of 0% CPU we consider the process
+        fully idle and hide the graph entirely, resetting _had_ram_model so it
+        reappears cleanly the next time a RAM model loads.
+
+        Peak label: shown only when the current reading is less than half the
+        session peak, so the user can see how active the process was recently
+        without the peak number cluttering the display during bursts.
+        """
         _mono = time.monotonic()
         idle_secs = (_mono - self._zero_since) if self._zero_since is not None else 0.0
         cpu_fully_hidden = idle_secs >= 2 * HISTORY_SECS  # 6 min of 0%
@@ -860,9 +1108,19 @@ class OllamaOverlay:
     def _draw_combined_graph(self, canvas: tk.Canvas,
                              vram_history: deque, gpu_history: deque,
                              w: int, h: int):
+        """Render overlaid VRAM (green) and GPU% (purple) sparklines in a model row.
+
+        VRAM is auto-scaled to its own peak so the line uses the full canvas height
+        regardless of absolute VRAM size.  GPU% is fixed at 0–100 so it is
+        comparable across models.  Both series use the same x-axis: sample index
+        with equal spacing (step = canvas_width / max_history).
+
+        The grid lines (6 vertical, 4 horizontal) are drawn first so they sit
+        behind the filled polygons.
+        """
         canvas.delete("all")
 
-        # Grid
+        # Subtle grid for readability
         for i in range(1, 7):
             canvas.create_line(int(w * i / 6), 0, int(w * i / 6), h,
                                fill=BORDER_CLR, width=1)
@@ -879,7 +1137,7 @@ class OllamaOverlay:
             n = len(vpts)
             vcoords = []
             for i, val in enumerate(vpts):
-                x = w - (n - 1 - i) * step
+                x = w - (n - 1 - i) * step   # oldest sample at left, newest at right
                 y = h - max(1, int(val / max_val * h))
                 vcoords.append((x, y))
 
@@ -888,11 +1146,13 @@ class OllamaOverlay:
                                   fill=GREEN_FILL, outline="")
             canvas.create_line([c for pt in vcoords for c in pt],
                                fill=GREEN, width=1)
+            # Current VRAM value as a small label in the top-left corner
             canvas.create_text(3, 3, text=human_bytes(vpts[-1]),
                                fill=ORANGE, anchor="nw", font=("Segoe UI", 7))
 
         # ── GPU% (purple, fixed 0-100) ────────────────────────────────────────
         gpts_raw = list(gpu_history)
+        # Filter out None samples but preserve their position for correct x alignment
         gpts = [(i, v) for i, v in enumerate(gpts_raw) if v is not None]
         n_total = len(gpts_raw)
 
@@ -912,6 +1172,7 @@ class OllamaOverlay:
                                   fill=GPU_FILL, outline="")
             canvas.create_line([c for pt in gcoords for c in pt],
                                fill=GPU_LINE, width=1)
+            # Current GPU% value as a small label in the top-right corner
             canvas.create_text(w - 3, 3, text=f"{gpts[-1][1]:.0f}%",
                                fill=GPU_LINE, anchor="ne", font=("Segoe UI", 7))
 
@@ -927,7 +1188,10 @@ class OllamaOverlay:
         self.visible = True
 
     def toggle_visibility(self):
-        """Called from tray (non-main thread) — schedule on Tk event loop."""
+        """Toggle window visibility — safe to call from the tray (non-main) thread.
+
+        Schedules the actual hide/show on the Tk event loop via root.after(0).
+        """
         if self.root:
             self.root.after(0, self._hide if self.visible else self._show)
 
@@ -944,6 +1208,11 @@ class OllamaOverlay:
     # ── Tray icon ─────────────────────────────────────────────────────────────
 
     def _run_tray(self):
+        """Build and run the system tray icon.  Blocks until tray.stop() is called.
+
+        Runs in a daemon thread started by run().  All callbacks that touch Tkinter
+        widgets must use root.after() to marshal back to the main thread.
+        """
         menu = pystray.Menu(
             pystray.MenuItem(
                 "Show / Hide",
@@ -971,6 +1240,7 @@ class OllamaOverlay:
     # ── Entry point ───────────────────────────────────────────────────────────
 
     def run(self):
+        """Start the tray icon thread then enter the Tk event loop (blocking)."""
         threading.Thread(target=self._run_tray, daemon=True).start()
         self.build_window()   # blocks until window is closed
 
