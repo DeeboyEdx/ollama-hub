@@ -64,6 +64,7 @@ import tkinter as tk
 import argparse
 from collections import deque
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 from PIL import Image, ImageDraw
@@ -354,6 +355,11 @@ class OllamaOverlay:
         self.gpu_enabled     = gpu_enabled and not remote  # remote implies no-gpu
         self.remote          = remote
         self.services        = services if services is not None else list(ALL_SERVICES)
+
+        # Derive the service host from the Ollama URL so that --url / OLLAMA_SERVER_URL
+        # automatically points service checks at the same machine as the Ollama API.
+        _svc_host = urlparse(ollama_url).hostname or "localhost"
+        self.services = [{**svc, "host": _svc_host} for svc in self.services]
         self.visible = True
         self.root: tk.Tk | None = None
         self.tray: pystray.Icon | None = None
