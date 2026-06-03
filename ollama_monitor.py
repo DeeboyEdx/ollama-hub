@@ -284,6 +284,34 @@ _STATE_BLINK_MS: dict[str, int] = {
 }
 
 
+class _Tooltip:
+    """Simple hover tooltip for any Tkinter widget.
+
+    Creates a borderless Toplevel just below the widget on <Enter> and
+    destroys it on <Leave>.
+    """
+    def __init__(self, widget: tk.Widget, text: str):
+        self._widget = widget
+        self._text   = text
+        self._tw: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, event=None):
+        x = self._widget.winfo_rootx() + 10
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tw = tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+        tk.Label(tw, text=self._text, bg="#1c2128", fg=FG,
+                 font=("Segoe UI", 8), padx=6, pady=3).pack()
+
+    def _hide(self, event=None):
+        if self._tw:
+            self._tw.destroy()
+            self._tw = None
+
 # ── GPU utilisation (NVML / nvidia-smi fallback) ──────────────────────────────
 # Try pynvml first (fast in-process NVML bindings).  Fall back to shelling out
 # to nvidia-smi when pynvml is not installed.  _NVML_OK gates all nvml calls.
@@ -538,8 +566,14 @@ class OllamaOverlay:
             indicator.pack(fill="x", anchor="w")
             dot = tk.Label(indicator, text="●", fg=DIM, bg=BG, font=("Segoe UI", 8))
             dot.pack(side="left")
-            tk.Label(indicator, text=f" {svc['label']}", fg=DIM, bg=BG,
-                     font=("Segoe UI", 8)).pack(side="left")
+            svc_lbl = tk.Label(indicator, text=f" {svc['label']}", fg=DIM, bg=BG,
+                               font=("Segoe UI", 8))
+            svc_lbl.pack(side="left")
+            # If this service has local logs, make the label clickable
+            if svc.get("log_dir") and not self.remote:
+                svc_lbl.config(cursor="hand2")
+                svc_lbl.bind("<Button-1>", lambda e, s=svc: self._open_log_tail(s))
+                _Tooltip(svc_lbl, "Click for logs")
             self._svc_dot_labels[svc["key"]] = dot
 
             client_lbl = tk.Label(col, text="", fg=DIM, bg=BG,
@@ -594,7 +628,28 @@ class OllamaOverlay:
                 lbl.pack_forget()
         _ = any_clients  # reserved for future footer height adjustment if needed
 
-    def _state_for_service(self, key: str) -> str:
+    def _open_log_tail(self, svc: dict):
+        """Open a new PowerShell window tailing the latest log for this service.
+
+        Finds the newest file matching the service's log_dir/log_pattern and
+        streams its last 20 lines with -Wait (like `tail -f`).
+        Only called for services that have a log_dir and when not in remote mode.
+        """
+        import subprocess
+        log_dir     = svc.get("log_dir", "")
+        log_pattern = svc.get("log_pattern", "*.log")
+        glob_path   = f"{log_dir}\\{log_pattern}"
+        ps_cmd = (
+            f"Get-ChildItem '{glob_path}' | Sort-Object LastWriteTime -Descending "
+            f"| Select-Object -First 1 -ExpandProperty FullName "
+            f"| ForEach-Object {{ Get-Content $_ -Wait -Tail 20 }}"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoExit", "-Command", ps_cmd],
+            creationflags=0x00000010,  # CREATE_NEW_CONSOLE — opens a visible window
+        )
+
+
         """Return a unified activity state string regardless of detection method.
 
         Log-monitored services return their McpLogMonitor state directly.
