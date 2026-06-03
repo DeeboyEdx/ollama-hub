@@ -79,10 +79,21 @@ GRAPH_H   = 48
 GRAPH_W   = WINDOW_W - 32   # inner width after content padx(8) + row padx(8)
 
 # Services to monitor (TCP reachability). Disable individually via CLI flags.
+# Optional log fields enable a clickable label that tails the newest log file:
+#   log_dir, log_pattern  — glob to find the active log file
+#   log_tooltip           — tooltip text shown on hover
+#   log_tail              — number of lines to tail (default 20)
 ALL_SERVICES = [
-    {"key": "litellm",   "label": "LiteLLM",        "host": "localhost", "port": 4000},
+    {"key": "litellm",   "label": "LiteLLM",        "host": "localhost", "port": 4000,
+     "log_dir":     r"D:\OneDrive\Documents\QuikScripts\Projects\LocalLLM\LiteLLMSetup\logs",
+     "log_pattern": "litellm-*.log",
+     "log_tooltip": "Monitor logs",
+     "log_tail":    30},
     {"key": "websearch", "label": "MCP: WebSearch",  "host": "localhost", "port": 8765,
-     "log_dir": r"C:\Users\aquar\mcp-servers\logs", "log_pattern": "gateway-*.log"},
+     "log_dir":     r"C:\Users\aquar\mcp-servers\logs",
+     "log_pattern": "gateway-*.log",
+     "log_tooltip": "Monitor logs",
+     "log_tail":    20},
 ]
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -573,7 +584,7 @@ class OllamaOverlay:
             if svc.get("log_dir") and not self.remote:
                 svc_lbl.config(cursor="hand2")
                 svc_lbl.bind("<Button-1>", lambda e, s=svc: self._open_log_tail(s))
-                _Tooltip(svc_lbl, "Click for logs")
+                _Tooltip(svc_lbl, svc.get("log_tooltip", "Monitor logs"))
             self._svc_dot_labels[svc["key"]] = dot
 
             client_lbl = tk.Label(col, text="", fg=DIM, bg=BG,
@@ -638,18 +649,19 @@ class OllamaOverlay:
         import subprocess
         log_dir     = svc.get("log_dir", "")
         log_pattern = svc.get("log_pattern", "*.log")
+        tail        = svc.get("log_tail", 20)
         glob_path   = f"{log_dir}\\{log_pattern}"
         ps_cmd = (
             f"Get-ChildItem '{glob_path}' | Sort-Object LastWriteTime -Descending "
             f"| Select-Object -First 1 -ExpandProperty FullName "
-            f"| ForEach-Object {{ Get-Content $_ -Wait -Tail 20 }}"
+            f"| ForEach-Object {{ Get-Content $_ -Wait -Tail {tail} }}"
         )
         subprocess.Popen(
             ["powershell", "-NoExit", "-Command", ps_cmd],
             creationflags=0x00000010,  # CREATE_NEW_CONSOLE — opens a visible window
         )
 
-
+    def _state_for_service(self, key: str) -> str:
         """Return a unified activity state string regardless of detection method.
 
         Log-monitored services return their McpLogMonitor state directly.
