@@ -407,6 +407,10 @@ class OllamaOverlay:
         # Tkinter widget references — keyed by model name
         self._model_widgets: dict[str, dict] = {}
 
+        # Ghost rows: models unloaded within the last 60 s
+        # Value dict holds the tk.Frame and the monotonic time of unload.
+        self._ghost_widgets: dict[str, dict] = {}
+
         self._last_status = ""   # tracks "online" | "idle" | "offline" to avoid redundant updates
 
         # Rolling deques for graph history
@@ -657,7 +661,7 @@ class OllamaOverlay:
             f"| ForEach-Object {{ Get-Content $_ -Wait -Tail {tail} }}"
         )
         subprocess.Popen(
-            ["powershell", "-NoExit", "-Command", ps_cmd],
+            ["powershell", "-NoProfile", "-NoExit", "-Command", ps_cmd],
             creationflags=0x00000010,  # CREATE_NEW_CONSOLE — opens a visible window
         )
 
@@ -753,8 +757,19 @@ class OllamaOverlay:
                        bd=0, font=("Segoe UI", 9))
         menu.add_command(label="Hide overlay", command=self._hide)
         menu.add_separator()
+        menu.add_command(label="Open Ollama logs", command=self._open_ollama_logs)
+        menu.add_separator()
         menu.add_command(label="Quit", command=self._quit)
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _open_ollama_logs(self):
+        """Tail the Ollama server log in a new PowerShell window."""
+        import subprocess
+        ps_cmd = r'Get-Content "$env:LOCALAPPDATA\Ollama\server.log" -Wait -Tail 30'
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NoExit", "-Command", ps_cmd],
+            creationflags=0x00000010,
+        )
 
     def _reset_position(self):
         sw = self.root.winfo_screenwidth()
@@ -882,46 +897,85 @@ class OllamaOverlay:
             self._update_cpu_header(any_ram=False)
             return
 
-        if not models:
-            self._set_status("idle")
-            self._clear_all_model_rows()
-            self.placeholder.config(text="No models loaded", fg=DIM)
-            self.placeholder.pack()
-            self._update_cpu_header(any_ram=False)
-            return
+        # Ollama is reachable — handle active models and ghost rows together
+        current_names = {m.get("name", "unknown") for m in models} if models else set()
 
-        self._set_status("online")
-        self.placeholder.pack_forget()
-
-        any_ram = any(
-            max(0, m.get("size", 0) - m.get("size_vram", 0)) > 0 for m in models
-        )
-        self._update_cpu_header(any_ram=any_ram)
-
-        current_names = {m.get("name", "unknown") for m in models}
-
-        # Remove rows for models that are no longer loaded
+        # Ghost any model that just dropped off the active list
         for name in list(self._model_widgets.keys()):
             if name not in current_names:
                 self._remove_model_row(name)
+                self._create_ghost_row(name)
 
-        # Update existing rows / create new ones
-        for m in models:
-            name = m.get("name", "unknown")
-            if name in self._model_widgets:
-                self._update_model_row(name, m)
-            else:
-                self._create_model_row(m)
+        # Expire ghosts older than 60 s; also clear ghosts for models that reloaded
+        mono_now = time.monotonic()
+        for name in list(self._ghost_widgets.keys()):
+            if name in current_names or mono_now - self._ghost_widgets[name]["unloaded_at"] > 60:
+                self._remove_ghost_row(name)
+
+        if models:
+            self._set_status("online")
+            any_ram = any(
+                max(0, m.get("size", 0) - m.get("size_vram", 0)) > 0 for m in models
+            )
+            self._update_cpu_header(any_ram=any_ram)
+
+            for m in models:
+                name = m.get("name", "unknown")
+                if name in self._model_widgets:
+                    self._update_model_row(name, m)
+                else:
+                    self._create_model_row(m)
+        else:
+            self._set_status("idle")
+            self._update_cpu_header(any_ram=False)
+
+        # Show placeholder only when nothing is visible (no active rows, no ghosts)
+        if not models and not self._ghost_widgets:
+            self.placeholder.config(text="No models loaded", fg=DIM)
+            self.placeholder.pack()
+        else:
+            self.placeholder.pack_forget()
 
     def _clear_all_model_rows(self):
         for name in list(self._model_widgets.keys()):
             self._remove_model_row(name)
+        for name in list(self._ghost_widgets.keys()):
+            self._remove_ghost_row(name)
 
     def _remove_model_row(self, name: str):
         if name in self._model_widgets:
             self._model_widgets[name]["frame"].destroy()
             del self._model_widgets[name]
         self._model_first_seen.pop(name, None)
+
+    def _create_ghost_row(self, name: str):
+        """Show a collapsed, dimmed row for a recently-unloaded model (expires after 60 s)."""
+        if name in self._ghost_widgets:
+            return
+        tag = ""
+        base_name = name
+        if ":" in name:
+            base_name, tag = name.rsplit(":", 1)
+        display_name = base_name if (not tag or tag == "latest") else f"{base_name}:{tag}"
+
+        unloaded_time_str = datetime.now().strftime("%H:%M:%S")
+
+        row = tk.Frame(self.content, bg=ROW_BG, padx=8, pady=4)
+        row.pack(fill="x", pady=2)
+
+        r1 = tk.Frame(row, bg=ROW_BG)
+        r1.pack(fill="x")
+        tk.Label(r1, text=display_name, fg=DIM, bg=ROW_BG,
+                 font=("Segoe UI", 9), anchor="w").pack(side="left")
+        tk.Label(r1, text=f"last seen {unloaded_time_str}", fg="#555555", bg=ROW_BG,
+                 font=("Segoe UI", 7)).pack(side="right")
+
+        self._ghost_widgets[name] = {"frame": row, "unloaded_at": time.monotonic()}
+
+    def _remove_ghost_row(self, name: str):
+        if name in self._ghost_widgets:
+            self._ghost_widgets[name]["frame"].destroy()
+            del self._ghost_widgets[name]
 
     def _set_status(self, status: str):
         """Update the header dot colour and tray icon to reflect Ollama reachability.
@@ -1286,6 +1340,24 @@ class OllamaOverlay:
         Runs in a daemon thread started by run().  All callbacks that touch Tkinter
         widgets must use root.after() to marshal back to the main thread.
         """
+        # Build log-tail entries for every service that has a log_dir
+        def _make_log_action(s):
+            def action(icon, item):
+                self._open_log_tail(s)
+            return action
+
+        log_items = []
+        for svc in self.services:
+            if svc.get("log_dir"):
+                log_items.append(pystray.MenuItem(
+                    f"Show {svc['label']} logs",
+                    _make_log_action(dict(svc)),
+                ))
+        log_items.append(pystray.MenuItem(
+            "Show Ollama logs",
+            lambda icon, item: self._open_ollama_logs(),
+        ))
+
         menu = pystray.Menu(
             pystray.MenuItem(
                 "Show / Hide",
@@ -1296,6 +1368,8 @@ class OllamaOverlay:
                 "Reset position",
                 lambda icon, item: self.root.after(0, self._reset_position),
             ),
+            pystray.Menu.SEPARATOR,
+            *log_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Quit",
