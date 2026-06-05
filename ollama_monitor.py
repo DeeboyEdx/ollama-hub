@@ -753,16 +753,66 @@ class OllamaOverlay:
 
     # ── Context menu ──────────────────────────────────────────────────────────
 
+    def _widget_model(self, widget) -> str | None:
+        """Return the model name whose row contains `widget`, or None."""
+        for name, w in self._model_widgets.items():
+            frame = w["frame"]
+            wid = widget
+            while wid is not None:
+                if wid is frame:
+                    return name
+                wid = getattr(wid, "master", None)
+        return None
+
     def _show_context_menu(self, event):
         menu = tk.Menu(self.root, tearoff=False, bg=ROW_BG, fg=FG,
                        activebackground=BORDER_CLR, activeforeground=FG,
                        bd=0, font=("Segoe UI", 9))
+
+        clicked_model = self._widget_model(event.widget)
+        if clicked_model:
+            display = self._display_name(clicked_model)
+            menu.add_command(label=f"Stop {display}",
+                             command=lambda: self._stop_model(clicked_model))
+            menu.add_separator()
+
         menu.add_command(label="Hide overlay", command=self._hide)
         menu.add_separator()
         menu.add_command(label="Open Ollama logs", command=self._open_ollama_logs)
         menu.add_separator()
         menu.add_command(label="Quit", command=self._quit)
         menu.tk_popup(event.x_root, event.y_root)
+
+    @staticmethod
+    def _display_name(name: str) -> str:
+        """Strip ':latest' tag; keep other tags."""
+        if ":" in name:
+            base, tag = name.rsplit(":", 1)
+            return base if tag == "latest" else f"{base}:{tag}"
+        return name
+
+    def _stop_model(self, name: str):
+        """Run `ollama stop <name>` in a background thread."""
+        import subprocess
+        threading.Thread(
+            target=lambda: subprocess.run(["ollama", "stop", name], capture_output=True),
+            daemon=True,
+        ).start()
+
+    def _stop_model_menu_items(self):
+        """Dynamic pystray submenu: one entry per loaded model, or a disabled placeholder."""
+        names = list(self._model_widgets.keys())
+        if not names:
+            return (pystray.MenuItem("(none running)", None, enabled=False),)
+
+        def make_stopper(n):
+            def action(icon, item):
+                self._stop_model(n)
+            return action
+
+        return tuple(
+            pystray.MenuItem(self._display_name(n), make_stopper(n)) for n in names
+        )
 
     def _open_ollama_logs(self):
         """Tail the Ollama server log in a new PowerShell window."""
@@ -1170,7 +1220,7 @@ class OllamaOverlay:
         r1 = tk.Frame(row, bg=ROW_BG)
         r1.pack(fill="x")
 
-        name_text = base_name if (not tag or tag == "latest") else f"{base_name}:{tag}"
+        name_text = self._display_name(name)
         tk.Label(r1, text=name_text, fg=FG, bg=ROW_BG,
                  font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
 
@@ -1372,6 +1422,11 @@ class OllamaOverlay:
             pystray.MenuItem(
                 "Reset position",
                 lambda icon, item: self.root.after(0, self._reset_position),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Stop model",
+                pystray.Menu(self._stop_model_menu_items),
             ),
             pystray.Menu.SEPARATOR,
             *log_items,
