@@ -654,8 +654,10 @@ class OllamaOverlay:
         log_dir     = svc.get("log_dir", "")
         log_pattern = svc.get("log_pattern", "*.log")
         tail        = svc.get("log_tail", 20)
+        title       = f"{svc.get('label', 'Service')} Logs"
         glob_path   = f"{log_dir}\\{log_pattern}"
         ps_cmd = (
+            f"$host.UI.RawUI.WindowTitle = '{title}'; "
             f"Get-ChildItem '{glob_path}' | Sort-Object LastWriteTime -Descending "
             f"| Select-Object -First 1 -ExpandProperty FullName "
             f"| ForEach-Object {{ Get-Content $_ -Wait -Tail {tail} }}"
@@ -765,7 +767,10 @@ class OllamaOverlay:
     def _open_ollama_logs(self):
         """Tail the Ollama server log in a new PowerShell window."""
         import subprocess
-        ps_cmd = r'Get-Content "$env:LOCALAPPDATA\Ollama\server.log" -Wait -Tail 30'
+        ps_cmd = (
+            r"$host.UI.RawUI.WindowTitle = 'Ollama Logs'; "
+            r'Get-Content "$env:LOCALAPPDATA\Ollama\server.log" -Wait -Tail 30'
+        )
         subprocess.Popen(
             ["powershell", "-NoProfile", "-NoExit", "-Command", ps_cmd],
             creationflags=0x00000010,
