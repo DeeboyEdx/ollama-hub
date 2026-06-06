@@ -1074,12 +1074,15 @@ class OllamaOverlay:
         """Begin the two-phase ghost animation for a just-unloaded model row."""
         if not self.root or name not in self._model_widgets:
             return
+        w = self._model_widgets[name]
+        # Capture height now while frame is fully rendered — avoids update_idletasks later
+        start_h = w["frame"].winfo_height() or 80
         self._ghosting[name] = time.monotonic()
         ts = datetime.now().strftime("%H:%M:%S")
-        self._ghost_phase1(name, 0, ts)
+        self._ghost_phase1(name, 0, ts, start_h)
 
-    def _ghost_phase1(self, name: str, step: int, ts: str):
-        """Phase 1 (~300 ms): fade name FG→DIM; hide canvas and detail row mid-way."""
+    def _ghost_phase1(self, name: str, step: int, ts: str, start_h: int):
+        """Phase 1: fade name FG→DIM; hide canvas and detail row mid-way."""
         w = self._model_widgets.get(name)
         if not w or not self.root or name not in self._ghosting:
             return
@@ -1090,30 +1093,25 @@ class OllamaOverlay:
             w["new_lbl"].pack_forget()
         if step < _GHOST_STEPS:
             self.root.after(_GHOST_STEP_MS,
-                            lambda: self._ghost_phase1(name, step + 1, ts))
+                            lambda: self._ghost_phase1(name, step + 1, ts, start_h))
         else:
             w["r2"].pack_forget()
+            # Lock height before collapsing
+            w["frame"].pack_propagate(False)
+            w["frame"].config(height=start_h)
             self.root.after(_GHOST_STEP_MS,
-                            lambda: self._ghost_phase2(name, 0, ts))
+                            lambda: self._ghost_phase2(name, 0, ts, start_h))
 
-    def _ghost_phase2(self, name: str, step: int, ts: str):
-        """Phase 2 (~300 ms): collapse frame height down to _GHOST_H px."""
+    def _ghost_phase2(self, name: str, step: int, ts: str, start_h: int):
+        """Phase 2: collapse frame height down to _GHOST_H px."""
         w = self._model_widgets.get(name)
         if not w or not self.root or name not in self._ghosting:
             return
-        frame = w["frame"]
-        if step == 0:
-            frame.update_idletasks()
-            h = frame.winfo_height()
-            frame.pack_propagate(False)
-            frame.config(height=h)
-            w["_start_h"] = h
         t = step / _GHOST_STEPS
-        start_h = w.get("_start_h", 40)
-        frame.config(height=max(_GHOST_H, int(start_h + (_GHOST_H - start_h) * t)))
+        w["frame"].config(height=max(_GHOST_H, int(start_h + (_GHOST_H - start_h) * t)))
         if step < _GHOST_STEPS:
             self.root.after(_GHOST_STEP_MS,
-                            lambda: self._ghost_phase2(name, step + 1, ts))
+                            lambda: self._ghost_phase2(name, step + 1, ts, start_h))
         else:
             self._finalize_ghost(name, ts)
 
