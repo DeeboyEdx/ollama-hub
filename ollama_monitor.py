@@ -71,7 +71,8 @@ from PIL import Image, ImageDraw
 import pystray
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_POLL_SECS  = 3
+DEFAULT_POLL_SECS        = 3
+DEFAULT_POLL_SECS_REMOTE = 5
 HISTORY_SECS       = 180                # 3-minute window
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 WINDOW_W  = 290
@@ -283,6 +284,10 @@ _BLINK_SLOW_MS    = 700
 _BLINK_IDLE_MS    = 1000   # minimum re-schedule interval when nothing is pulsing
 _RESTART_BLINK_MS = 700    # blue restart pulse: same tempo as LIGHT
 
+_GHOST_STEPS   = 10   # animation steps per phase
+_GHOST_STEP_MS = 90   # ms per step → 900 ms per phase, 1800 ms total
+_GHOST_H       = 28   # final collapsed height in pixels
+
 # Maps McpLogMonitor state → dot half-cycle duration.
 # IDLE and UNAVAILABLE are absent intentionally — they render as a solid dim dot
 # with no scheduling, so _blink_tick skips them (half_cycle == 0 fallthrough).
@@ -410,6 +415,10 @@ class OllamaOverlay:
         # Ghost rows: models unloaded within the last 60 s
         # Value dict holds the tk.Frame and the monotonic time of unload.
         self._ghost_widgets: dict[str, dict] = {}
+
+        # Models currently mid-ghost-animation; maps name → monotonic unload time.
+        # Entries here are excluded from normal _update_ui processing.
+        self._ghosting: dict[str, float] = {}
 
         self._last_status = ""   # tracks "online" | "idle" | "offline" to avoid redundant updates
 
@@ -769,16 +778,20 @@ class OllamaOverlay:
                        activebackground=BORDER_CLR, activeforeground=FG,
                        bd=0, font=("Segoe UI", 9))
 
-        clicked_model = self._widget_model(event.widget)
-        if clicked_model:
-            display = self._display_name(clicked_model)
-            menu.add_command(label=f"Stop {display}",
-                             command=lambda: self._stop_model(clicked_model))
-            menu.add_separator()
+        if not self.remote:
+            clicked_model = self._widget_model(event.widget)
+            if clicked_model:
+                display = self._display_name(clicked_model)
+                menu.add_command(label=f"Stop {display}",
+                                 command=lambda: self._stop_model(clicked_model))
+                menu.add_separator()
 
         menu.add_command(label="Hide overlay", command=self._hide)
-        menu.add_separator()
-        menu.add_command(label="Open Ollama logs", command=self._open_ollama_logs)
+
+        if not self.remote:
+            menu.add_separator()
+            menu.add_command(label="Open Ollama logs", command=self._open_ollama_logs)
+
         menu.add_separator()
         menu.add_command(label="Quit", command=self._quit)
         menu.tk_popup(event.x_root, event.y_root)
@@ -955,11 +968,19 @@ class OllamaOverlay:
         # Ollama is reachable — handle active models and ghost rows together
         current_names = {m.get("name", "unknown") for m in models} if models else set()
 
-        # Ghost any model that just dropped off the active list
+        # Ghost any model that just dropped off the active list (skip those mid-animation)
         for name in list(self._model_widgets.keys()):
-            if name not in current_names:
-                self._remove_model_row(name)
-                self._create_ghost_row(name)
+            if name not in current_names and name not in self._ghosting:
+                self._animate_to_ghost(name)
+
+        # Model reappeared while its ghost animation was still running — cancel and recreate
+        for name in list(self._ghosting.keys()):
+            if name in current_names:
+                if name in self._model_widgets:
+                    self._model_widgets[name]["frame"].destroy()
+                    del self._model_widgets[name]
+                self._model_first_seen.pop(name, None)
+                self._ghosting.pop(name)
 
         # Expire ghosts older than 60 s; also clear ghosts for models that reloaded
         mono_now = time.monotonic()
@@ -984,14 +1005,21 @@ class OllamaOverlay:
             self._set_status("idle")
             self._update_cpu_header(any_ram=False)
 
-        # Show placeholder only when nothing is visible (no active rows, no ghosts)
-        if not models and not self._ghost_widgets:
+        # Show placeholder only when nothing is visible (no active rows, no ghosts, no animations)
+        if not models and not self._ghost_widgets and not self._ghosting:
             self.placeholder.config(text="No models loaded", fg=DIM)
             self.placeholder.pack()
         else:
             self.placeholder.pack_forget()
 
     def _clear_all_model_rows(self):
+        # Hard-cancel any in-progress ghost animations
+        for name in list(self._ghosting.keys()):
+            if name in self._model_widgets:
+                self._model_widgets[name]["frame"].destroy()
+                del self._model_widgets[name]
+            self._model_first_seen.pop(name, None)
+        self._ghosting.clear()
         for name in list(self._model_widgets.keys()):
             self._remove_model_row(name)
         for name in list(self._ghost_widgets.keys()):
@@ -1031,6 +1059,85 @@ class OllamaOverlay:
         if name in self._ghost_widgets:
             self._ghost_widgets[name]["frame"].destroy()
             del self._ghost_widgets[name]
+
+    # ── Ghost animation ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lerp_color(c1: str, c2: str, t: float) -> str:
+        """Interpolate between two #rrggbb colours; t ∈ [0, 1]."""
+        r1,g1,b1 = int(c1[1:3],16), int(c1[3:5],16), int(c1[5:7],16)
+        r2,g2,b2 = int(c2[1:3],16), int(c2[3:5],16), int(c2[5:7],16)
+        return "#{:02x}{:02x}{:02x}".format(
+            int(r1+(r2-r1)*t), int(g1+(g2-g1)*t), int(b1+(b2-b1)*t))
+
+    def _animate_to_ghost(self, name: str):
+        """Begin the two-phase ghost animation for a just-unloaded model row."""
+        if not self.root or name not in self._model_widgets:
+            return
+        self._ghosting[name] = time.monotonic()
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._ghost_phase1(name, 0, ts)
+
+    def _ghost_phase1(self, name: str, step: int, ts: str):
+        """Phase 1 (~300 ms): fade name FG→DIM; hide canvas and detail row mid-way."""
+        w = self._model_widgets.get(name)
+        if not w or not self.root or name not in self._ghosting:
+            return
+        t = step / _GHOST_STEPS
+        w["name_lbl"].config(fg=self._lerp_color(FG, DIM, t))
+        if step == _GHOST_STEPS // 2:
+            w["canvas"].pack_forget()
+            w["new_lbl"].pack_forget()
+        if step < _GHOST_STEPS:
+            self.root.after(_GHOST_STEP_MS,
+                            lambda: self._ghost_phase1(name, step + 1, ts))
+        else:
+            w["r2"].pack_forget()
+            self.root.after(_GHOST_STEP_MS,
+                            lambda: self._ghost_phase2(name, 0, ts))
+
+    def _ghost_phase2(self, name: str, step: int, ts: str):
+        """Phase 2 (~300 ms): collapse frame height down to _GHOST_H px."""
+        w = self._model_widgets.get(name)
+        if not w or not self.root or name not in self._ghosting:
+            return
+        frame = w["frame"]
+        if step == 0:
+            frame.update_idletasks()
+            h = frame.winfo_height()
+            frame.pack_propagate(False)
+            frame.config(height=h)
+            w["_start_h"] = h
+        t = step / _GHOST_STEPS
+        start_h = w.get("_start_h", 40)
+        frame.config(height=max(_GHOST_H, int(start_h + (_GHOST_H - start_h) * t)))
+        if step < _GHOST_STEPS:
+            self.root.after(_GHOST_STEP_MS,
+                            lambda: self._ghost_phase2(name, step + 1, ts))
+        else:
+            self._finalize_ghost(name, ts)
+
+    def _finalize_ghost(self, name: str, ts: str):
+        """Convert the animated row into a static ghost: name + last-seen timestamp."""
+        w = self._model_widgets.get(name)
+        if not w or not self.root:
+            self._ghosting.pop(name, None)
+            return
+        frame = w["frame"]
+        frame.pack_propagate(True)
+        frame.config(pady=4)
+        r1 = w.get("r1")
+        if r1:
+            for child in r1.winfo_children():
+                child.destroy()
+            tk.Label(r1, text=self._display_name(name), fg=DIM, bg=ROW_BG,
+                     font=("Segoe UI", 9), anchor="w").pack(side="left")
+            tk.Label(r1, text=f"last seen {ts}", fg=DIM, bg=ROW_BG,
+                     font=("Segoe UI", 7)).pack(side="right")
+        unloaded_at = self._ghosting.pop(name, time.monotonic())
+        del self._model_widgets[name]
+        self._model_first_seen.pop(name, None)
+        self._ghost_widgets[name] = {"frame": frame, "unloaded_at": unloaded_at}
 
     def _set_status(self, status: str):
         """Update the header dot colour and tray icon to reflect Ollama reachability.
@@ -1221,8 +1328,9 @@ class OllamaOverlay:
         r1.pack(fill="x")
 
         name_text = self._display_name(name)
-        tk.Label(r1, text=name_text, fg=FG, bg=ROW_BG,
-                 font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
+        name_lbl = tk.Label(r1, text=name_text, fg=FG, bg=ROW_BG,
+                 font=("Segoe UI", 9, "bold"), anchor="w")
+        name_lbl.pack(side="left")
 
         if param_size:
             tk.Label(r1, text=f"  {param_size}", fg=ACCENT, bg=ROW_BG,
@@ -1254,6 +1362,7 @@ class OllamaOverlay:
             "frame": row, "canvas": canvas,
             "ram_lbl": ram_lbl, "exp_lbl": exp_lbl,
             "new_lbl": new_lbl,
+            "r1": r1, "r2": r2, "name_lbl": name_lbl,
         }
 
     def _update_model_row(self, name: str, m: dict):
@@ -1395,23 +1504,34 @@ class OllamaOverlay:
         Runs in a daemon thread started by run().  All callbacks that touch Tkinter
         widgets must use root.after() to marshal back to the main thread.
         """
-        # Build log-tail entries for every service that has a log_dir
-        def _make_log_action(s):
-            def action(icon, item):
-                self._open_log_tail(s)
-            return action
-
+        # Build log-tail and stop-model entries — local only
         log_items = []
-        for svc in self.services:
-            if svc.get("log_dir"):
-                log_items.append(pystray.MenuItem(
-                    f"Show {svc['label']} logs",
-                    _make_log_action(dict(svc)),
-                ))
-        log_items.append(pystray.MenuItem(
-            "Show Ollama logs",
-            lambda icon, item: self._open_ollama_logs(),
-        ))
+        stop_item = []
+        if not self.remote:
+            def _make_log_action(s):
+                def action(icon, item):
+                    self._open_log_tail(s)
+                return action
+
+            for svc in self.services:
+                if svc.get("log_dir"):
+                    log_items.append(pystray.MenuItem(
+                        f"Show {svc['label']} logs",
+                        _make_log_action(dict(svc)),
+                    ))
+            log_items.append(pystray.MenuItem(
+                "Show Ollama logs",
+                lambda icon, item: self._open_ollama_logs(),
+            ))
+            stop_item = [
+                pystray.MenuItem(
+                    "Stop model",
+                    pystray.Menu(self._stop_model_menu_items),
+                ),
+                pystray.Menu.SEPARATOR,
+            ]
+
+        local_sections = [*stop_item, *log_items]
 
         menu = pystray.Menu(
             pystray.MenuItem(
@@ -1423,13 +1543,10 @@ class OllamaOverlay:
                 "Reset position",
                 lambda icon, item: self.root.after(0, self._reset_position),
             ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                "Stop model",
-                pystray.Menu(self._stop_model_menu_items),
+            *(
+                [pystray.Menu.SEPARATOR, *local_sections]
+                if local_sections else []
             ),
-            pystray.Menu.SEPARATOR,
-            *log_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Quit",
@@ -1464,8 +1581,8 @@ def main():
         help=f"Ollama base URL (default: OLLAMA_SERVER_URL env var, or {DEFAULT_OLLAMA_URL})"
     )
     parser.add_argument(
-        "--poll", type=int, default=DEFAULT_POLL_SECS, metavar="SECS",
-        help=f"Poll interval in seconds (default: {DEFAULT_POLL_SECS})"
+        "--poll", type=int, default=None, metavar="SECS",
+        help=f"Poll interval in seconds (default: {DEFAULT_POLL_SECS}s local, {DEFAULT_POLL_SECS_REMOTE}s remote)"
     )
     parser.add_argument(
         "--no-gpu", "--no-cpu", "--no-xpu",
@@ -1494,9 +1611,12 @@ def main():
         disabled.add("websearch")
     services = [s for s in ALL_SERVICES if s["key"] not in disabled]
 
+    poll_default = DEFAULT_POLL_SECS_REMOTE if args.remote else DEFAULT_POLL_SECS
+    poll_secs = max(1, args.poll if args.poll is not None else poll_default)
+
     app = OllamaOverlay(
         ollama_url=args.url,
-        poll_secs=max(1, args.poll),
+        poll_secs=poll_secs,
         gpu_enabled=not args.no_gpu,
         services=services,
         remote=args.remote,
