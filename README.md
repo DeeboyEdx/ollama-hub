@@ -84,14 +84,36 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 | Argument | Default | Description |
 |---|---|---|
 | `--url URL` | `http://localhost:11434` | Ollama server URL |
-| `--poll SECS` | `3` | Polling interval in seconds (min 1) |
+| `--poll SECS` | `3` local / `5` remote | Polling interval in seconds (min 1) |
 | `--no-gpu` | off | Disable GPU% and CPU% monitoring |
 | `--no-cpu` | off | Alias for `--no-gpu` |
 | `--no-xpu` | off | Alias for `--no-gpu` |
+| `--remote` | off | Master toggle for remote servers: disables GPU/CPU graphs, TCP client tracking, log monitoring. Also blocks `--webserve`. |
+| `--webserve` | off | Start a built-in HTTP server serving a live web dashboard (LAN-accessible) |
+| `--port PORT` | `11435` | Port for the web dashboard (only relevant with `--webserve`) |
 
 `--url` falls back to the `OLLAMA_SERVER_URL` environment variable if set.
 
-> **Note:** GPU% and CPU% are always read from the **local machine** running the overlay, not the Ollama server. If you point `--url` at a remote machine, use `--no-gpu` / `--no-xpu` to suppress those graphs — otherwise they'll reflect your local hardware, not the server's.
+> **Note:** GPU% and CPU% are always read from the **local machine** running the overlay, not the Ollama server. If you point `--url` at a remote machine, use `--remote` to suppress local-only features — otherwise the graphs will reflect your local hardware, not the server's.
+
+---
+
+## Web Dashboard
+
+Pass `--webserve` to serve a live dashboard on your LAN:
+
+```bat
+"Ollama Monitor.exe" --webserve
+"Ollama Monitor.exe" --webserve --port 8080
+```
+
+Then open **`http://<your-pc-ip>:11435/`** in any browser (desktop or phone).
+
+The dashboard shows the same model cards, VRAM/GPU sparklines, CPU histogram, and service status dots as the overlay — auto-refreshing every 1 s while a model is active, 5 s while loaded-idle, or 15 s when Ollama is quiet.
+
+The overlay shows a **●** dot (amber = running, dim = stopped) in the services footer. Click it to toggle the web server on/off without restarting the app.
+
+> **Firewall:** Windows may prompt to allow `OllamaMonitor.exe` through the firewall the first time you use `--webserve`. Allow it for private networks to enable LAN access.
 
 ---
 
@@ -106,9 +128,11 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 ## Files
 
 ```
-├── Ollama Monitor.exe  # Standalone executable — run this
-├── Ollama Monitor.spec # PyInstaller recipe
+├── OllamaMonitor.exe   # Standalone executable — run this
+├── OllamaMonitor.spec  # PyInstaller recipe
 ├── ollama_monitor.py   # Source code
+├── web_ui.html         # Web dashboard (served live in dev; embedded in exe at build time)
+├── embed_html.py       # Build helper: embeds web_ui.html into ollama_monitor.py
 ├── requirements.txt    # Python dependencies (for dev/rebuild)
 ├── build.bat           # Double-click to rebuild the exe
 ├── run.bat             # Dev launcher (console window visible)
