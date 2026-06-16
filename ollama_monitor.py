@@ -39,12 +39,17 @@ CLI flags
 ────────────────────────────────────────────────────────────────────────────────
 
   --url URL         Ollama base URL (default: localhost:11434)
-  --poll SECS       Poll interval (default: 3 s)
+  --poll SECS       Poll interval (default: 3 s local, 5 s remote)
   --no-gpu          Disable GPU/CPU metrics
   --no-litellm      Hide LiteLLM service indicator
   --no-websearch    Hide WebSearch service indicator
   --remote          Master toggle: disables everything that requires local access
-                    (implies --no-gpu, no TCP client tracking, no log monitoring)
+                    (implies --no-gpu, no TCP client tracking, no log monitoring;
+                    also blocks --webserve)
+  --webserve        Start a built-in HTTP server serving a live web dashboard.
+                    Binds to 0.0.0.0 (LAN-accessible). Not available in --remote mode.
+  --port PORT       Port for the built-in web server (default: 11435).
+                    Dashboard available at http://<host>:<port>/
 
 ────────────────────────────────────────────────────────────────────────────────
 Usage
@@ -52,6 +57,8 @@ Usage
 
   python ollama_monitor.py
   python ollama_monitor.py --url http://my-server:11434 --remote
+  python ollama_monitor.py --webserve
+  python ollama_monitor.py --webserve --port 8080
 """
 
 import re
