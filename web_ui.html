@@ -100,7 +100,7 @@
   .mem-ram  { color: var(--blue); }
 
   /* ── Mini sparkline ── */
-  canvas.spark { display: block; width: 100%; height: 40px; margin: 6px 0 2px; }
+  canvas.spark { display: block; width: 100%; height: 72px; margin: 6px 0 2px; }
 
   /* ── Ghost card ── */
   .card.ghost { opacity: .5; }
@@ -192,7 +192,7 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 
 function drawSpark(canvas, vramHistory, gpuHistory) {
   const W = canvas.width  = canvas.offsetWidth;
-  const H = canvas.height = 40;
+  const H = canvas.height = 72;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, W, H);
 
