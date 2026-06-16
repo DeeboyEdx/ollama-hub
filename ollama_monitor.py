@@ -57,6 +57,7 @@ Usage
 import re
 import sys
 import time
+import json
 import glob as _glob_mod
 import socket
 import threading
@@ -65,10 +66,16 @@ import argparse
 from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from PIL import Image, ImageDraw
 import pystray
+
+# ── Web UI HTML (embedded at build time by build.bat) ─────────────────────────
+# During development, served from web_ui.html on disk (see _WebServer).
+# The build step replaces this placeholder with the actual file contents.
+_WEB_UI_HTML: str = ""  # @@WEB_UI_HTML@@
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEFAULT_POLL_SECS        = 3
@@ -388,16 +395,91 @@ def make_tray_icon(color: str) -> Image.Image:
 
 # ── Overlay window ────────────────────────────────────────────────────────────
 
+# ── Web server ────────────────────────────────────────────────────────────────
+
+class _WebServer:
+    """Tiny HTTP server that exposes /api/status (JSON) and / (web UI).
+
+    Runs in a daemon thread.  The overlay writes telemetry into `self.snapshot`
+    under `self.lock` each poll cycle; the HTTP handler reads it lock-free
+    (dict reads are atomic in CPython, but we use the lock for safety).
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.lock = threading.Lock()
+        self.snapshot: dict = {}
+        self._server: ThreadingHTTPServer | None = None
+
+    def update(self, snapshot: dict):
+        with self.lock:
+            self.snapshot = snapshot
+
+    def _make_handler(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass  # silence access log
+
+            def do_GET(self):
+                if self.path == "/api/status":
+                    with server.lock:
+                        data = server.snapshot.copy()
+                    body = json.dumps(data).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path in ("/", "/index.html"):
+                    # Dev: serve from disk; prod: use embedded string
+                    import os
+                    html: str = ""
+                    disk_path = os.path.join(os.path.dirname(
+                        os.path.abspath(sys.argv[0])), "web_ui.html")
+                    if _WEB_UI_HTML:
+                        html = _WEB_UI_HTML
+                    elif os.path.exists(disk_path):
+                        with open(disk_path, encoding="utf-8") as f:
+                            html = f.read()
+                    else:
+                        html = "<h1>web_ui.html not found</h1>"
+                    body = html.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        return Handler
+
+    def start(self):
+        handler = self._make_handler()
+        self._server = ThreadingHTTPServer((self.host, self.port), handler)
+        t = threading.Thread(target=self._server.serve_forever, daemon=True)
+        t.start()
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+
+
 class OllamaOverlay:
     def __init__(self, ollama_url: str, poll_secs: int = DEFAULT_POLL_SECS,
                  gpu_enabled: bool = True, services: list | None = None,
-                 remote: bool = False):
+                 remote: bool = False, web_server: "_WebServer | None" = None):
         self.ollama_url      = ollama_url
         self.poll_interval_ms = poll_secs * 1000
-        # Number of history samples that fit in the rolling 3-minute window
         self.max_history     = max(2, HISTORY_SECS * 1000 // self.poll_interval_ms)
-        self.gpu_enabled     = gpu_enabled and not remote  # remote implies no-gpu
+        self.gpu_enabled     = gpu_enabled and not remote
         self.remote          = remote
+        self.web_server      = web_server
         self.services        = services if services is not None else list(ALL_SERVICES)
 
         # Derive the service host from the Ollama URL so that --url / OLLAMA_SERVER_URL
@@ -933,8 +1015,49 @@ class OllamaOverlay:
                         ).start()
         self._refresh_client_labels()
         self._update_ui(models, error)
+        if self.web_server is not None:
+            self._push_web_snapshot(models, error)
         if self.root:
             self._after_id = self.root.after(self.poll_interval_ms, self._poll)
+
+    def _push_web_snapshot(self, models, error):
+        """Build a JSON-serialisable snapshot of current telemetry for the web UI."""
+        svc_states = {}
+        for svc in self.services:
+            key = svc["key"]
+            svc_states[key] = {
+                "label":    svc["label"],
+                "up":       self._service_up.get(key, False),
+                "state":    self._service_state.get(key, "IDLE"),
+                "activity": self._service_activity.get(key, 0),
+            }
+
+        model_list = []
+        if models:
+            for m in models:
+                name = m.get("name", "unknown")
+                model_list.append({
+                    "name":       name,
+                    "display":    self._display_name(name),
+                    "size_vram":  m.get("size_vram", 0),
+                    "size_ram":   max(0, m.get("size", 0) - m.get("size_vram", 0)),
+                    "size":       m.get("size", 0),
+                    "expires_at": m.get("expires_at", ""),
+                    "param_size": m.get("details", {}).get("parameter_size", ""),
+                    "quant":      m.get("details", {}).get("quantization_level", ""),
+                    "vram_history": list(self._vram_history.get(name, [])),
+                })
+
+        gpu_val = self._gpu_history[-1] if self._gpu_history else None
+        self.web_server.update({
+            "ts":         datetime.now().strftime("%H:%M:%S"),
+            "status":     error if error else ("online" if models else "idle"),
+            "models":     model_list,
+            "services":   svc_states,
+            "gpu_pct":    gpu_val,
+            "gpu_history": [v for v in self._gpu_history if v is not None],
+            "poll_ms":    self.poll_interval_ms,
+        })
 
     def _update_ui(self, models, error):
         # Record VRAM history first
@@ -1563,6 +1686,8 @@ class OllamaOverlay:
 
     def run(self):
         """Start the tray icon thread then enter the Tk event loop (blocking)."""
+        if self.web_server is not None:
+            self.web_server.start()
         threading.Thread(target=self._run_tray, daemon=True).start()
         self.build_window()   # blocks until window is closed
 
@@ -1600,6 +1725,14 @@ def main():
         help="Remote/LAN mode: disables all local-only features "
              "(service activity, client tracking, GPU%%/CPU%%)"
     )
+    parser.add_argument(
+        "--webserve", action="store_true",
+        help="Enable the built-in web UI server"
+    )
+    parser.add_argument(
+        "--port", type=int, default=11435, metavar="PORT",
+        help="Web server port (default: 11435, only used with --webserve)"
+    )
     args = parser.parse_args()
 
     disabled = set()
@@ -1612,12 +1745,18 @@ def main():
     poll_default = DEFAULT_POLL_SECS_REMOTE if args.remote else DEFAULT_POLL_SECS
     poll_secs = max(1, args.poll if args.poll is not None else poll_default)
 
+    web_server = None
+    if args.webserve:
+        web_server = _WebServer(host="0.0.0.0", port=args.port)
+        print(f"Web UI: http://localhost:{args.port}/")
+
     app = OllamaOverlay(
         ollama_url=args.url,
         poll_secs=poll_secs,
         gpu_enabled=not args.no_gpu,
         services=services,
         remote=args.remote,
+        web_server=web_server,
     )
     app.run()
 

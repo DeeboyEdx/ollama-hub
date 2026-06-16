@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ollama Monitor</title>
+<style>
+  :root {
+    --bg:        #0d1117;
+    --row-bg:    #161b22;
+    --border:    #21262d;
+    --fg:        #e6edf3;
+    --dim:       #8b949e;
+    --green:     #3fb950;
+    --green-dim: #2d7d3a;
+    --blue:      #58a6ff;
+    --orange:    #d29922;
+    --red:       #f85149;
+    --purple:    #bc8cff;
+    --accent:    #58a6ff;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
+    min-height: 100vh;
+    padding: 16px;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-left { display: flex; align-items: center; gap: 10px; }
+
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: .3px; }
+
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--dim);
+    flex-shrink: 0;
+    transition: background .4s;
+  }
+  .status-dot.online  { background: var(--green); }
+  .status-dot.idle    { background: var(--dim); }
+  .status-dot.offline { background: var(--red); }
+
+  .ts { color: var(--dim); font-size: 11px; }
+
+  /* ── Refresh controls ── */
+  .controls {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--dim);
+  }
+  .controls select {
+    background: var(--row-bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  /* ── Model cards ── */
+  #models { display: flex; flex-direction: column; gap: 8px; }
+
+  .card {
+    background: var(--row-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+
+  .card-header {
+    display: flex; justify-content: space-between;
+    align-items: baseline; margin-bottom: 6px;
+  }
+
+  .model-name { font-weight: 600; font-size: 14px; }
+  .model-meta { font-size: 11px; color: var(--dim); }
+  .model-param { color: var(--accent); font-size: 11px; margin-left: 6px; }
+  .model-quant { color: var(--dim); font-size: 11px; }
+
+  .mem-row {
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--dim); margin-top: 4px;
+  }
+  .mem-vram { color: var(--green); }
+  .mem-ram  { color: var(--blue); }
+
+  /* ── Mini sparkline ── */
+  canvas.spark { display: block; width: 100%; height: 40px; margin: 6px 0 2px; }
+
+  /* ── Ghost card ── */
+  .card.ghost { opacity: .5; }
+  .card.ghost .model-name { color: var(--dim); font-weight: 400; }
+  .ghost-ts { font-size: 10px; color: var(--dim); }
+
+  /* ── Placeholder ── */
+  .placeholder {
+    color: var(--dim); font-size: 13px;
+    text-align: center; padding: 32px 0;
+  }
+
+  /* ── Services footer ── */
+  #services {
+    display: flex; gap: 14px; flex-wrap: wrap;
+    margin-top: 16px; padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  .svc {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--dim);
+  }
+
+  .svc-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--dim); flex-shrink: 0;
+    transition: background .3s;
+  }
+  .svc-dot.up   { background: var(--green-dim); }
+  .svc-dot.down { background: var(--red); }
+
+  /* ── GPU badge ── */
+  #gpu-badge {
+    font-size: 11px; color: var(--purple);
+    margin-top: 10px;
+  }
+
+  /* ── Error banner ── */
+  #error-banner {
+    display: none;
+    background: #2d1515; border: 1px solid var(--red);
+    border-radius: 6px; padding: 8px 12px;
+    color: var(--red); font-size: 12px;
+    margin-bottom: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <div class="status-dot" id="status-dot"></div>
+    <h1>Ollama Monitor</h1>
+    <span class="ts" id="ts"></span>
+  </div>
+  <div class="controls">
+    Refresh:
+    <select id="refresh-select">
+      <option value="auto">Auto</option>
+      <option value="1000">1 s</option>
+      <option value="3000" selected>3 s</option>
+      <option value="5000">5 s</option>
+      <option value="10000">10 s</option>
+      <option value="15000">15 s</option>
+      <option value="30000">30 s</option>
+    </select>
+  </div>
+</header>
+
+<div id="error-banner"></div>
+<div id="models"></div>
+<div id="gpu-badge"></div>
+<div id="services"></div>
+
+<script>
+// ── Utilities ──────────────────────────────────────────────────────────────
+
+function humanBytes(b) {
+  if (b === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / Math.pow(1024, i)).toFixed(i > 1 ? 1 : 0) + ' ' + units[i];
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ── Sparkline drawing ──────────────────────────────────────────────────────
+
+function drawSpark(canvas, vramHistory, gpuHistory) {
+  const W = canvas.width  = canvas.offsetWidth;
+  const H = canvas.height = 40;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 6; i++) {
+    ctx.beginPath(); ctx.moveTo(W*i/6, 0); ctx.lineTo(W*i/6, H); ctx.stroke();
+  }
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath(); ctx.moveTo(0, H*i/4); ctx.lineTo(W, H*i/4); ctx.stroke();
+  }
+
+  const n = Math.max(vramHistory.length, gpuHistory.length, 2);
+  const step = W / (n - 1);
+
+  // VRAM (green)
+  if (vramHistory.length >= 2) {
+    const max = Math.max(...vramHistory) || 1;
+    const pts = vramHistory.map((v, i) => [W - (vramHistory.length - 1 - i) * step, H - Math.max(1, v / max * H)]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], H);
+    pts.forEach(([x, y]) => ctx.lineTo(x, y));
+    ctx.lineTo(pts[pts.length-1][0], H);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(63,185,80,0.15)';
+    ctx.fill();
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 1; ctx.stroke();
+    // Label
+    ctx.fillStyle = '#d29922'; ctx.font = '9px Segoe UI';
+    ctx.fillText(humanBytes(vramHistory[vramHistory.length-1]), 3, 10);
+  }
+
+  // GPU% (purple)
+  const gpuValid = gpuHistory.filter(v => v !== null);
+  if (gpuValid.length >= 2) {
+    const pts = gpuHistory.map((v, i) => v !== null
+      ? [W - (gpuHistory.length - 1 - i) * step, H - Math.max(1, v / 100 * H)]
+      : null).filter(Boolean);
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], H);
+    pts.forEach(([x, y]) => ctx.lineTo(x, y));
+    ctx.lineTo(pts[pts.length-1][0], H);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(188,140,255,0.15)';
+    ctx.fill();
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.strokeStyle = '#bc8cff'; ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+
+function render(data) {
+  // Header
+  document.getElementById('ts').textContent = data.ts || '';
+  const dot = document.getElementById('status-dot');
+  dot.className = 'status-dot ' + (data.status || 'offline');
+
+  // Error banner
+  const banner = document.getElementById('error-banner');
+  if (data.status === 'offline' || data.status === 'error') {
+    banner.style.display = 'block';
+    banner.textContent = data.status === 'offline' ? 'Ollama offline' : 'Connection error';
+  } else {
+    banner.style.display = 'none';
+  }
+
+  // Models
+  const container = document.getElementById('models');
+  container.innerHTML = '';
+  const models = data.models || [];
+
+  if (models.length === 0) {
+    const p = document.createElement('div');
+    p.className = 'placeholder';
+    p.textContent = data.status === 'idle' ? 'No models loaded' : 'Connecting…';
+    container.appendChild(p);
+  } else {
+    models.forEach(m => {
+      const card = document.createElement('div');
+      card.className = 'card';
+
+      const hdr = document.createElement('div');
+      hdr.className = 'card-header';
+
+      const left = document.createElement('div');
+      const nameEl = document.createElement('span');
+      nameEl.className = 'model-name';
+      nameEl.textContent = m.display || m.name;
+      left.appendChild(nameEl);
+      if (m.param_size) {
+        const p = document.createElement('span');
+        p.className = 'model-param';
+        p.textContent = m.param_size;
+        left.appendChild(p);
+      }
+
+      const right = document.createElement('span');
+      right.className = 'model-quant';
+      right.textContent = m.quant || '';
+
+      hdr.appendChild(left);
+      hdr.appendChild(right);
+      card.appendChild(hdr);
+
+      // Sparkline
+      const cvs = document.createElement('canvas');
+      cvs.className = 'spark';
+      card.appendChild(cvs);
+      requestAnimationFrame(() => drawSpark(cvs, m.vram_history || [], data.gpu_history || []));
+
+      // Mem row
+      const mem = document.createElement('div');
+      mem.className = 'mem-row';
+      const vramSpan = document.createElement('span');
+      vramSpan.className = 'mem-vram';
+      vramSpan.textContent = m.size_vram ? 'VRAM ' + humanBytes(m.size_vram) : '';
+      const ramSpan = document.createElement('span');
+      ramSpan.className = 'mem-ram';
+      ramSpan.textContent = m.size_ram ? 'RAM ' + humanBytes(m.size_ram) : '';
+      mem.appendChild(vramSpan);
+      mem.appendChild(ramSpan);
+      card.appendChild(mem);
+
+      container.appendChild(card);
+    });
+  }
+
+  // GPU badge
+  const gpuBadge = document.getElementById('gpu-badge');
+  gpuBadge.textContent = (data.gpu_pct !== null && data.gpu_pct !== undefined)
+    ? `GPU ${data.gpu_pct.toFixed(0)}%` : '';
+
+  // Services
+  const svcContainer = document.getElementById('services');
+  svcContainer.innerHTML = '';
+  const svcs = data.services || {};
+  Object.values(svcs).forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'svc';
+    const dot = document.createElement('div');
+    dot.className = 'svc-dot ' + (s.up ? 'up' : 'down');
+    const lbl = document.createElement('span');
+    lbl.textContent = s.label;
+    div.appendChild(dot);
+    div.appendChild(lbl);
+    svcContainer.appendChild(div);
+  });
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────
+
+let _timer = null;
+let _lastData = null;
+
+function scheduleNext(intervalVal, data) {
+  let ms;
+  if (intervalVal === 'auto') {
+    const hasModels = data && data.models && data.models.length > 0;
+    const gpuActive = data && data.gpu_pct !== null && data.gpu_pct > 5;
+    if (gpuActive)      ms = 1000;
+    else if (hasModels) ms = 5000;
+    else                ms = 15000;
+  } else {
+    ms = parseInt(intervalVal, 10);
+  }
+  _timer = setTimeout(poll, ms);
+}
+
+async function poll() {
+  const sel = document.getElementById('refresh-select').value;
+  try {
+    const res = await fetch('/api/status');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    _lastData = data;
+    render(data);
+  } catch (e) {
+    // Render offline state if we can't reach the server
+    render({ status: 'offline', ts: new Date().toLocaleTimeString() });
+  }
+  scheduleNext(sel, _lastData);
+}
+
+document.getElementById('refresh-select').addEventListener('change', () => {
+  clearTimeout(_timer);
+  poll();
+});
+
+// Kick off
+poll();
+</script>
+</body>
+</html>
