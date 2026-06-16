@@ -320,15 +320,34 @@ class _Tooltip:
         widget.bind("<Enter>", self._show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
 
+    @property
+    def text(self) -> str:
+        return self._text
+
+    @text.setter
+    def text(self, value: str):
+        self._text = value
+
     def _show(self, event=None):
-        x = self._widget.winfo_rootx() + 10
-        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        sw = self._widget.winfo_screenwidth()
+        wx = self._widget.winfo_rootx()
+        wy = self._widget.winfo_rooty()
+        wh = self._widget.winfo_height()
         self._tw = tw = tk.Toplevel(self._widget)
         tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
         tw.attributes("-topmost", True)
-        tk.Label(tw, text=self._text, bg="#1c2128", fg=FG,
-                 font=("Segoe UI", 8), padx=6, pady=3).pack()
+        lbl = tk.Label(tw, text=self._text, bg="#1c2128", fg=FG,
+                       font=("Segoe UI", 8), padx=6, pady=3)
+        lbl.pack()
+        tw.update_idletasks()
+        tip_w = tw.winfo_reqwidth()
+        # If widget is on right half of screen, anchor tooltip to the left of it
+        if wx > sw // 2:
+            x = wx + self._widget.winfo_width() - tip_w
+        else:
+            x = wx + 10
+        y = wy + wh + 4
+        tw.wm_geometry(f"+{x}+{y}")
 
     def _hide(self, event=None):
         if self._tw:
@@ -410,11 +429,16 @@ class _WebServer:
         self.port = port
         self.lock = threading.Lock()
         self.snapshot: dict = {}
+        self.last_request_at: float = 0.0  # monotonic time of last /api/status hit
         self._server: ThreadingHTTPServer | None = None
 
     def update(self, snapshot: dict):
         with self.lock:
             self.snapshot = snapshot
+
+    def is_active(self, window_secs: float = 30.0) -> bool:
+        """Return True if a web client polled within the last window_secs."""
+        return (time.monotonic() - self.last_request_at) < window_secs
 
     def _make_handler(self):
         server = self
@@ -425,6 +449,7 @@ class _WebServer:
 
             def do_GET(self):
                 if self.path == "/api/status":
+                    server.last_request_at = time.monotonic()
                     with server.lock:
                         data = server.snapshot.copy()
                     body = json.dumps(data).encode()
@@ -490,6 +515,8 @@ class OllamaOverlay:
         self.root: tk.Tk | None = None
         self.tray: pystray.Icon | None = None
         self._drag_x = self._drag_y = 0
+        self._win_x  = self._win_y  = 0
+        self._dragging = False
 
         # Tkinter widget references — keyed by model name
         self._model_widgets: dict[str, dict] = {}
@@ -528,6 +555,9 @@ class OllamaOverlay:
         # Service dot widget references (populated in _build_services_footer)
         self._svc_dot_labels:    dict[str, tk.Label]   = {}
         self._svc_client_labels: dict[str, tk.Label]   = {}
+        self._web_dot: tk.Label | None = None  # web monitor activity dot
+        self._web_dot_tip: "_Tooltip | None" = None
+        self._web_server_stopped: bool = False  # user toggled the server off
 
         # Blink animation state per service
         self._svc_blink_state:   dict[str, bool]       = {s["key"]: False  for s in self.services}
@@ -581,16 +611,17 @@ class OllamaOverlay:
 
         self.root.bind("<ButtonPress-1>", self._on_drag_start)
         self.root.bind("<B1-Motion>", self._on_drag_move)
+        self.root.bind("<ButtonRelease-1>", lambda e: setattr(self, '_dragging', False))
         self.root.bind("<ButtonPress-3>", self._show_context_menu)
 
         self._build_header()
         self._build_content_area()
         self._build_services_footer()
         if self.services:
-            self.root.after(200, self._blink_tick)     # start service dot animation
-        self.root.after(200, self._ollama_blink_tick)  # start Ollama header dot animation
+            self.root.after(200, self._blink_tick)
+        self.root.after(200, self._ollama_blink_tick)
 
-        self.root.after(100, self._poll)               # first data fetch after brief delay
+        self.root.after(100, self._poll)
         self.root.mainloop()
 
     def _build_header(self):
@@ -686,6 +717,20 @@ class OllamaOverlay:
                                   font=("Segoe UI", 7), anchor="w", justify="left")
             client_lbl.pack(fill="x", padx=(10, 0))
             self._svc_client_labels[svc["key"]] = client_lbl
+
+        # Web monitor dot — far right, top-aligned, no label, tooltip + click to toggle
+        if self.web_server is not None:
+            web_col = tk.Frame(footer, bg=BG)
+            web_col.pack(side="right", anchor="n", padx=(4, 0))
+            self._web_dot = tk.Label(web_col, text="●", fg=ORANGE, bg=BG,
+                                     font=("Segoe UI", 8), cursor="hand2")
+            self._web_dot.pack(anchor="n")
+            self._web_dot_tip = _Tooltip(self._web_dot, "Monitored via HTTP — click to stop")
+            def _web_dot_click(e):
+                self._toggle_web_server()
+                return "break"
+            self._web_dot.bind("<Button-1>", _web_dot_click)
+            self._web_dot.bind("<B1-Motion>", lambda e: "break")
 
     def _update_services_footer(self):
         # Kept for manual one-shot refresh; ongoing updates handled by _blink_tick.
@@ -835,11 +880,20 @@ class OllamaOverlay:
     # ── Drag ─────────────────────────────────────────────────────────────────
 
     def _on_drag_start(self, event):
-        self._drag_x, self._drag_y = event.x, event.y
+        if self._web_dot and str(event.widget) == str(self._web_dot):
+            self._dragging = False
+            return
+        self._dragging = True
+        self._drag_x = event.x_root
+        self._drag_y = event.y_root
+        self._win_x  = self.root.winfo_x()
+        self._win_y  = self.root.winfo_y()
 
     def _on_drag_move(self, event):
-        x = self.root.winfo_x() + event.x - self._drag_x
-        y = self.root.winfo_y() + event.y - self._drag_y
+        if not self._dragging:
+            return
+        x = self._win_x + event.x_root - self._drag_x
+        y = self._win_y + event.y_root - self._drag_y
         self.root.geometry(f"+{x}+{y}")
 
     # ── Context menu ──────────────────────────────────────────────────────────
@@ -921,9 +975,26 @@ class OllamaOverlay:
             creationflags=0x00000010,
         )
 
-    def _reset_position(self):
-        sw = self.root.winfo_screenwidth()
-        self.root.geometry(f"+{sw - WINDOW_W - 16}+10")
+    def _toggle_web_server(self):
+        """Start or stop the web server on user click of the web dot."""
+        if self.web_server is None:
+            return
+        if self._web_server_stopped:
+            # Restart
+            self.web_server.start()
+            self._web_server_stopped = False
+            if self._web_dot:
+                self._web_dot.config(fg=ORANGE)
+            if self._web_dot_tip:
+                self._web_dot_tip.text = "Monitored via HTTP — click to stop"
+        else:
+            # Stop
+            threading.Thread(target=self.web_server.stop, daemon=True).start()
+            self._web_server_stopped = True
+            if self._web_dot:
+                self._web_dot.config(fg=DIM)
+            if self._web_dot_tip:
+                self._web_dot_tip.text = "Web server stopped — click to start"
 
     # ── Poll + UI update ──────────────────────────────────────────────────────
 
@@ -1017,6 +1088,14 @@ class OllamaOverlay:
         self._update_ui(models, error)
         if self.web_server is not None:
             self._push_web_snapshot(models, error)
+            if self._web_dot and self._web_dot.winfo_exists():
+                if self._web_server_stopped:
+                    color = DIM
+                elif self.web_server.is_active():
+                    color = SVC_BLINK_DIM
+                else:
+                    color = ORANGE
+                self._web_dot.config(fg=color)
         if self.root:
             self._after_id = self.root.after(self.poll_interval_ms, self._poll)
 
@@ -1049,14 +1128,17 @@ class OllamaOverlay:
                 })
 
         gpu_val = self._gpu_history[-1] if self._gpu_history else None
+        cpu_val = self._cpu_history[-1][1] if self._cpu_history else None
         self.web_server.update({
-            "ts":         datetime.now().strftime("%H:%M:%S"),
-            "status":     error if error else ("online" if models else "idle"),
-            "models":     model_list,
-            "services":   svc_states,
-            "gpu_pct":    gpu_val,
+            "ts":          datetime.now().strftime("%H:%M:%S"),
+            "status":      error if error else ("online" if models else "idle"),
+            "models":      model_list,
+            "services":    svc_states,
+            "gpu_pct":     gpu_val,
             "gpu_history": [v for v in self._gpu_history if v is not None],
-            "poll_ms":    self.poll_interval_ms,
+            "cpu_pct":     cpu_val,
+            "cpu_history": [v for _, v in self._cpu_history if v is not None],
+            "poll_ms":     self.poll_interval_ms,
         })
 
     def _update_ui(self, models, error):
@@ -1312,12 +1394,14 @@ class OllamaOverlay:
         # Remove any dead processes from cache
         self._ollama_proc = [p for p in (self._ollama_proc or [])
                              if self._is_proc_alive(p)]
-        # Find newly appeared ollama processes
+        # Find newly appeared ollama/llama-server processes
         try:
             cached_pids = {p.pid for p in self._ollama_proc}
             for p in _psutil.process_iter(["name", "pid"]):
                 name = p.info["name"].lower()
-                if "ollama" in name and "app" not in name and p.pid not in cached_pids:
+                is_ollama = "ollama" in name and "app" not in name
+                is_llama  = "llama-server" in name or "llama_server" in name
+                if (is_ollama or is_llama) and p.pid not in cached_pids:
                     try:
                         p.cpu_percent()   # prime — first call always returns 0
                         self._ollama_proc.append(p)
@@ -1617,6 +1701,10 @@ class OllamaOverlay:
                 self.root.after_cancel(self._after_id)
             self.root.after(0, self.root.destroy)
 
+    def _reset_position(self):
+        sw = self.root.winfo_screenwidth()
+        self.root.geometry(f"+{sw - WINDOW_W - 16}+10")
+
     # ── Tray icon ─────────────────────────────────────────────────────────────
 
     def _run_tray(self):
@@ -1747,8 +1835,11 @@ def main():
 
     web_server = None
     if args.webserve:
-        web_server = _WebServer(host="0.0.0.0", port=args.port)
-        print(f"Web UI: http://localhost:{args.port}/")
+        if args.remote:
+            print("Warning: --webserve is not available in --remote mode and will be ignored.")
+        else:
+            web_server = _WebServer(host="0.0.0.0", port=args.port)
+            print(f"Web UI: http://localhost:{args.port}/")
 
     app = OllamaOverlay(
         ollama_url=args.url,

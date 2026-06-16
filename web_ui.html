@@ -72,7 +72,18 @@
     cursor: pointer;
   }
 
-  /* ── Model cards ── */
+  /* ── CPU bar ── */
+  #cpu-bar-wrap {
+    margin-bottom: 10px;
+  }
+  .cpu-bar-row {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--dim);
+  }
+  canvas.cpu-spark {
+    flex: 1; height: 36px; display: block;
+  }
+  .cpu-val { min-width: 36px; text-align: right; color: #39c5cf; }
   #models { display: flex; flex-direction: column; gap: 8px; }
 
   .card {
@@ -172,6 +183,13 @@
 </header>
 
 <div id="error-banner"></div>
+<div id="cpu-bar-wrap" style="display:none">
+  <div class="cpu-bar-row">
+    <span>CPU</span>
+    <canvas id="cpu-spark" class="cpu-spark"></canvas>
+    <span class="cpu-val" id="cpu-val"></span>
+  </div>
+</div>
 <div id="models"></div>
 <div id="gpu-badge"></div>
 <div id="services"></div>
@@ -187,6 +205,39 @@ function humanBytes(b) {
 }
 
 function lerp(a, b, t) { return a + (b - a) * t; }
+
+function drawCpuSpark(canvas, cpuHistory) {
+  const W = canvas.width  = canvas.offsetWidth;
+  const H = canvas.height = 36;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  for (let i = 1; i < 6; i++) {
+    ctx.beginPath(); ctx.moveTo(W*i/6, 0); ctx.lineTo(W*i/6, H); ctx.stroke();
+  }
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath(); ctx.moveTo(0, H*i/4); ctx.lineTo(W, H*i/4); ctx.stroke();
+  }
+
+  if (cpuHistory.length < 2) return;
+  const n = cpuHistory.length;
+  const step = W / (n - 1);
+  const pts = cpuHistory.map((v, i) => [W - (n - 1 - i) * step, H - Math.max(1, v / 100 * H)]);
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], H);
+  pts.forEach(([x, y]) => ctx.lineTo(x, y));
+  ctx.lineTo(pts[pts.length-1][0], H);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(57,197,207,0.15)';
+  ctx.fill();
+
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.strokeStyle = '#39c5cf'; ctx.lineWidth = 1; ctx.stroke();
+}
 
 // ── Sparkline drawing ──────────────────────────────────────────────────────
 
@@ -262,6 +313,18 @@ function render(data) {
     banner.textContent = data.status === 'offline' ? 'Ollama offline' : 'Connection error';
   } else {
     banner.style.display = 'none';
+  }
+
+  // CPU bar
+  const cpuWrap = document.getElementById('cpu-bar-wrap');
+  const cpuHistory = data.cpu_history || [];
+  if (data.cpu_pct !== null && data.cpu_pct !== undefined) {
+    cpuWrap.style.display = 'block';
+    document.getElementById('cpu-val').textContent = data.cpu_pct.toFixed(0) + '%';
+    const cpuCvs = document.getElementById('cpu-spark');
+    requestAnimationFrame(() => drawCpuSpark(cpuCvs, cpuHistory));
+  } else {
+    cpuWrap.style.display = 'none';
   }
 
   // Models
