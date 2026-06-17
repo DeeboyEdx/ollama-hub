@@ -41,13 +41,15 @@ CLI flags
   --url URL         Ollama base URL (default: localhost:11434)
   --poll SECS       Poll interval (default: 3 s local, 5 s remote)
   --no-gpu          Disable GPU/CPU metrics
-  --no-litellm      Hide LiteLLM service indicator
-  --no-websearch    Hide WebSearch service indicator
-  --remote          Master toggle: disables everything that requires local access
-                    (implies --no-gpu, no TCP client tracking, no log monitoring;
-                    also blocks --webserve)
-  --webserve        Start a built-in HTTP server serving a live web dashboard.
-                    Binds to 0.0.0.0 (LAN-accessible). Not available in --remote mode.
+  --no-litellm          Hide LiteLLM service indicator
+  --litellm-logs DIR    LiteLLM log directory (default: your path under LiteLLMSetup/logs).
+                        If the directory does not exist, the indicator is hidden automatically.
+  --no-websearch        Hide WebSearch service indicator
+  --websearch-mcp-logs DIR  WebSearch MCP log directory (default: your path under mcp-servers/logs).
+                        If the directory does not exist, the indicator is hidden automatically.
+  --remote          Master toggle for remote servers: disables GPU/CPU graphs, TCP client tracking,
+                    log monitoring. Also disables the web server.
+  --no-webserve     Disable the built-in web server (web server is on by default)
   --port PORT       Port for the built-in web server (default: 11435).
                     Dashboard available at http://<host>:<port>/
 
@@ -57,8 +59,8 @@ Usage
 
   python ollama_monitor.py
   python ollama_monitor.py --url http://my-server:11434 --remote
-  python ollama_monitor.py --webserve
-  python ollama_monitor.py --webserve --port 8080
+  python ollama_monitor.py --no-webserve
+  python ollama_monitor.py --port 8080
 """
 
 import re
@@ -110,6 +112,9 @@ ALL_SERVICES = [
      "log_tooltip": "Monitor logs",
      "log_tail":    20},
 ]
+
+DEFAULT_LITELLM_LOG_DIR   = ALL_SERVICES[0]["log_dir"]
+DEFAULT_WEBSEARCH_LOG_DIR = ALL_SERVICES[1]["log_dir"]
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG          = "#0d1117"
@@ -1858,8 +1863,16 @@ def main():
         help="Disable LiteLLM service status indicator"
     )
     parser.add_argument(
+        "--litellm-logs", metavar="DIR", default=None,
+        help=f"LiteLLM log directory (default: {DEFAULT_LITELLM_LOG_DIR})"
+    )
+    parser.add_argument(
         "--no-websearch", action="store_true",
         help="Disable WebSearch MCP service status indicator"
+    )
+    parser.add_argument(
+        "--websearch-mcp-logs", metavar="DIR", default=None,
+        help=f"WebSearch MCP log directory (default: {DEFAULT_WEBSEARCH_LOG_DIR})"
     )
     parser.add_argument(
         "--remote", action="store_true",
@@ -1867,29 +1880,44 @@ def main():
              "(service activity, client tracking, GPU%%/CPU%%)"
     )
     parser.add_argument(
-        "--webserve", action="store_true",
-        help="Enable the built-in web UI server"
+        "--no-webserve", action="store_true",
+        help="Disable the built-in web UI server (enabled by default)"
     )
     parser.add_argument(
         "--port", type=int, default=11435, metavar="PORT",
-        help="Web server port (default: 11435, only used with --webserve)"
+        help="Web server port (default: 11435)"
     )
     args = parser.parse_args()
 
+    import os
     disabled = set()
     if args.no_litellm:
         disabled.add("litellm")
     if args.no_websearch:
         disabled.add("websearch")
-    services = [s for s in ALL_SERVICES if s["key"] not in disabled]
+
+    # Apply custom log dirs and auto-hide services whose log dir doesn't exist
+    log_dir_overrides = {
+        "litellm":   args.litellm_logs  or DEFAULT_LITELLM_LOG_DIR,
+        "websearch": args.websearch_mcp_logs or DEFAULT_WEBSEARCH_LOG_DIR,
+    }
+    services = []
+    for svc in ALL_SERVICES:
+        if svc["key"] in disabled:
+            continue
+        svc = dict(svc)  # shallow copy — don't mutate the global
+        svc["log_dir"] = log_dir_overrides[svc["key"]]
+        if not os.path.isdir(svc["log_dir"]):
+            continue  # not installed on this machine
+        services.append(svc)
 
     poll_default = DEFAULT_POLL_SECS_REMOTE if args.remote else DEFAULT_POLL_SECS
     poll_secs = max(1, args.poll if args.poll is not None else poll_default)
 
     web_server = None
-    if args.webserve:
+    if not args.no_webserve:
         if args.remote:
-            print("Warning: --webserve is not available in --remote mode and will be ignored.")
+            print("Warning: web server is not available in --remote mode and will be disabled.")
         else:
             web_server = _WebServer(host="0.0.0.0", port=args.port)
             print(f"Web UI: http://localhost:{args.port}/")
