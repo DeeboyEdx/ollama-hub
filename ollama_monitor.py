@@ -121,6 +121,8 @@ BORDER_CLR  = "#21262d"
 GREEN       = "#3fb950"
 GREEN_FILL  = "#1a4228"   # dark green for graph fill
 SVC_BLINK_DIM   = "#1a6b28" # mid-dark green for service dot idle-on state
+WEB_DOT_OFF     = "#6b2020" # muted dark red  — web server stopped
+WEB_DOT_IDLE    = "#555555" # gray            — server on, no recent clients (>10s)
 SVC_RESTART_ON  = "#58a6ff" # bright blue for restart pulse on
 SVC_RESTART_OFF = "#0d2645" # dim blue for restart pulse off
 GPU_LINE    = "#a371f7"   # purple for GPU % line
@@ -619,6 +621,7 @@ class OllamaOverlay:
         self.root.bind("<ButtonPress-1>", self._on_drag_start)
         self.root.bind("<B1-Motion>", self._on_drag_move)
         self.root.bind("<ButtonRelease-1>", lambda e: setattr(self, '_dragging', False))
+        self.root.bind("<Double-Button-1>", self._on_double_click)
         self.root.bind("<ButtonPress-3>", self._show_context_menu)
 
         self._build_header()
@@ -732,12 +735,13 @@ class OllamaOverlay:
             self._web_dot = tk.Label(web_col, text="●", fg=ORANGE, bg=BG,
                                      font=("Segoe UI", 8), cursor="hand2")
             self._web_dot.pack(anchor="n")
-            self._web_dot_tip = _Tooltip(self._web_dot, "Monitored via HTTP — click to stop")
+            self._web_dot_tip = _Tooltip(self._web_dot, "Web dashboard · click to stop")
             def _web_dot_click(e):
                 self._toggle_web_server()
                 return "break"
             self._web_dot.bind("<Button-1>", _web_dot_click)
             self._web_dot.bind("<B1-Motion>", lambda e: "break")
+            self._web_dot.bind("<ButtonPress-3>", self._show_web_dot_menu)
 
     def _update_services_footer(self):
         # Kept for manual one-shot refresh; ongoing updates handled by _blink_tick.
@@ -874,9 +878,23 @@ class OllamaOverlay:
                 if _now >= self._svc_next_toggle[key]:
                     blink = not self._svc_blink_state[key]
                     self._svc_blink_state[key] = blink
-                    dot.config(fg=GREEN if blink else SVC_BLINK_DIM)
+                    dot.config(fg=ORANGE if blink else SVC_BLINK_DIM)
                     self._svc_next_toggle[key] = _now + half_cycle / 1000
                 min_next = min(min_next, self._svc_next_toggle[key])
+
+        # Web dot — driven here so the amber flash (0.4s) is visible between poll cycles
+        if self._web_dot and self._web_dot.winfo_exists() and self.web_server is not None:
+            if self._web_server_stopped:
+                self._web_dot.config(fg=WEB_DOT_OFF)
+            else:
+                age = time.monotonic() - self.web_server.last_request_at
+                if age < 0.4:
+                    self._web_dot.config(fg=ORANGE)
+                    min_next = min(min_next, _now + 0.15)  # wake soon to clear flash
+                elif age < 10.0:
+                    self._web_dot.config(fg=SVC_BLINK_DIM)
+                else:
+                    self._web_dot.config(fg=WEB_DOT_IDLE)
 
         # Schedule the next tick only as far away as the soonest pending toggle
         delay_ms = max(50, int((min_next - time.monotonic()) * 1000))
@@ -902,6 +920,42 @@ class OllamaOverlay:
         x = self._win_x + event.x_root - self._drag_x
         y = self._win_y + event.y_root - self._drag_y
         self.root.geometry(f"+{x}+{y}")
+
+    def _on_double_click(self, event):
+        if self._web_dot and str(event.widget) == str(self._web_dot):
+            return
+        self._reset_position()
+
+    def _get_local_ip(self) -> str:
+        """Return the machine's LAN IP (non-loopback). Falls back to hostname."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return socket.gethostname()
+
+    def _web_dashboard_url(self) -> str:
+        return f"http://{self._get_local_ip()}:{self.web_server.port}"
+
+    def _show_web_dot_menu(self, event):
+        url = self._web_dashboard_url()
+        menu = tk.Menu(self.root, tearoff=False, bg=ROW_BG, fg=FG,
+                       activebackground=BORDER_CLR, activeforeground=FG,
+                       bd=0, font=("Segoe UI", 9))
+        if self._web_server_stopped:
+            menu.add_command(label="Start web dashboard",
+                             command=self._toggle_web_server)
+        else:
+            menu.add_command(label="Open web dashboard",
+                             command=lambda: __import__("webbrowser").open(url))
+        menu.add_command(label="Copy web address",
+                         command=lambda: (self.root.clipboard_clear(),
+                                          self.root.clipboard_append(url)))
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     # ── Context menu ──────────────────────────────────────────────────────────
 
@@ -991,17 +1045,17 @@ class OllamaOverlay:
             self.web_server.start()
             self._web_server_stopped = False
             if self._web_dot:
-                self._web_dot.config(fg=ORANGE)
+                self._web_dot.config(fg=WEB_DOT_IDLE)  # blink_tick will update from here
             if self._web_dot_tip:
-                self._web_dot_tip.text = "Monitored via HTTP — click to stop"
+                self._web_dot_tip.text = "Web dashboard · click to stop"
         else:
             # Stop
             threading.Thread(target=self.web_server.stop, daemon=True).start()
             self._web_server_stopped = True
             if self._web_dot:
-                self._web_dot.config(fg=DIM)
+                self._web_dot.config(fg=WEB_DOT_OFF)
             if self._web_dot_tip:
-                self._web_dot_tip.text = "Web server stopped — click to start"
+                self._web_dot_tip.text = "Web dashboard — stopped · click to start"
 
     # ── Poll + UI update ──────────────────────────────────────────────────────
 
@@ -1095,14 +1149,6 @@ class OllamaOverlay:
         self._update_ui(models, error)
         if self.web_server is not None:
             self._push_web_snapshot(models, error)
-            if self._web_dot and self._web_dot.winfo_exists():
-                if self._web_server_stopped:
-                    color = DIM
-                elif self.web_server.is_active():
-                    color = SVC_BLINK_DIM
-                else:
-                    color = ORANGE
-                self._web_dot.config(fg=color)
         if self.root:
             self._after_id = self.root.after(self.poll_interval_ms, self._poll)
 
