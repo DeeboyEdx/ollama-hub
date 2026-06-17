@@ -88,9 +88,13 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 | `--no-gpu` | off | Disable GPU% and CPU% monitoring |
 | `--no-cpu` | off | Alias for `--no-gpu` |
 | `--no-xpu` | off | Alias for `--no-gpu` |
-| `--remote` | off | Master toggle for remote servers: disables GPU/CPU graphs, TCP client tracking, log monitoring. Also blocks `--webserve`. |
-| `--webserve` | off | Start a built-in HTTP server serving a live web dashboard (LAN-accessible) |
-| `--port PORT` | `11435` | Port for the web dashboard (only relevant with `--webserve`) |
+| `--remote` | off | Master toggle for remote servers: disables GPU/CPU graphs, TCP client tracking, log monitoring, and the web server. |
+| `--no-webserve` | off | Disable the built-in web dashboard (on by default) |
+| `--port PORT` | `11435` | Web dashboard port |
+| `--no-litellm` | off | Hide LiteLLM service indicator |
+| `--litellm-logs DIR` | *(your install path)* | LiteLLM log directory. If the directory doesn't exist, the indicator is hidden automatically. |
+| `--no-websearch` | off | Hide WebSearch MCP service indicator |
+| `--websearch-mcp-logs DIR` | *(your install path)* | WebSearch MCP log directory. If the directory doesn't exist, the indicator is hidden automatically. |
 
 `--url` falls back to the `OLLAMA_SERVER_URL` environment variable if set.
 
@@ -100,20 +104,21 @@ python ollama_monitor.py --url http://192.168.1.50:11434 --poll 5 --no-gpu
 
 ## Web Dashboard
 
-Pass `--webserve` to serve a live dashboard on your LAN:
+The web dashboard runs on by default on port 11435. Open **`http://<your-pc-ip>:11435/`** in any browser (desktop or phone).
 
 ```bat
-"Ollama Monitor.exe" --webserve
-"Ollama Monitor.exe" --webserve --port 8080
+"Ollama Monitor.exe"               :: web server on by default
+"Ollama Monitor.exe" --port 8080   :: custom port
+"Ollama Monitor.exe" --no-webserve :: disable it
 ```
-
-Then open **`http://<your-pc-ip>:11435/`** in any browser (desktop or phone).
 
 The dashboard shows the same model cards, VRAM/GPU sparklines, CPU histogram, and service status dots as the overlay — auto-refreshing every 1 s while a model is active, 5 s while loaded-idle, or 15 s when Ollama is quiet.
 
-The overlay shows a **●** dot (amber = running, dim = stopped) in the services footer. Click it to toggle the web server on/off without restarting the app.
+The overlay shows a **●** dot in the services footer:
+- **Right-click** → Open web dashboard / Copy web address (uses your LAN IP)
+- **Left-click** → toggle server on/off
 
-> **Firewall:** Windows may prompt to allow `OllamaMonitor.exe` through the firewall the first time you use `--webserve`. Allow it for private networks to enable LAN access.
+> **Firewall:** Windows may prompt to allow `Ollama Monitor.exe` through the firewall on first launch. Allow it for private networks to enable LAN access.
 
 ---
 
